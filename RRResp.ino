@@ -15,11 +15,7 @@
 // Định nghĩa chân IN để điều khiển chiều quay (Bridge H)
 #define DIR_1  5 
 #define DIR_2  19
-#define DIR_3  22
-// Chân đọc cảm biến công tắc hành trình
-#define hanhtrinh_1 16
-#define hanhtrinh_2 17
-#define hanhtrinh_3 36     
+#define DIR_3  22   
 // Cấu hình bộ điều khiển PWM của ESP32      
 #define PWM_CHANNEL_1 0   
 #define PWM_CHANNEL_2 1
@@ -33,7 +29,6 @@ bool flagStop = false;          // Cờ dừng khẩn cấp
 bool flagReset = false;         // Cờ reset vị trí
 bool flag = false;              // Cờ trạng thái dừng/chạy chung
 bool reset_goc = false;         // Cờ đưa góc về 0
-bool flagCt = false;            // Cờ kích hoạt kiểm tra công tắc hành trình
 volatile long posi_1=0;         // Vị trí thực tế (xung) motor 1
 volatile long posi_2=0;         // Vị trí thực tế (xung) motor 2
 volatile long posi_3=0;         // Vị trí thực tế (xung) motor 3
@@ -409,7 +404,6 @@ void thoigian(){
 void reset(){
   if (flagReset) {
     flagReset = false; 
-    flagCt = true;
     reset_goc = true;
   }
 }
@@ -417,28 +411,12 @@ void chay(){
   if (flagRun) {
       flagRun = false; 
       flag=false;
-      flagCt = false;
       reset_goc = false;
   }
 }
 void dung(){
   if (flagStop) {
     flagStop = false;  
-    for (int p = 150; p >= 0; p -= 5) {
-      Pwm_out_1(0, p);
-      Pwm_out_2(0, p);
-      Pwm_out_3(0, p);
-      delay(10);
-    }
-    flag=true;
-  }
-}
-void ct_hanh_trinh(){
-  if (!flagCt) return;
-  int ct_1 = digitalRead(hanhtrinh_1);
-  int ct_2 = digitalRead(hanhtrinh_2);
-  int ct_3 = digitalRead(hanhtrinh_3);
-  if (ct_1){
     for (int p = 150; p >= 0; p -= 5) {
       Pwm_out_1(0, p);
       Pwm_out_2(0, p);
@@ -459,9 +437,6 @@ void setup() {
   pinMode(DIR_1,OUTPUT);
   pinMode(DIR_2,OUTPUT);
   pinMode(DIR_3, OUTPUT);
-  pinMode(hanhtrinh_1, INPUT_PULLUP);
-  pinMode(hanhtrinh_2, INPUT_PULLUP);
-  pinMode(hanhtrinh_3, INPUT_PULLUP);
   ledcSetup(PWM_CHANNEL_1, PWM_FREQ, PWM_RESOLUTION);
   ledcAttachPin(PWM_1, PWM_CHANNEL_1);
   ledcSetup(PWM_CHANNEL_2, PWM_FREQ, PWM_RESOLUTION);
@@ -479,7 +454,6 @@ void loop() {
   xuly(); 
   chay();
   dung();
-  ct_hanh_trinh();
   reset();
   dieukhien();
   thoigian();
