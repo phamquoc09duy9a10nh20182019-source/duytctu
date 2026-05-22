@@ -31,39 +31,19 @@ A = [0,       0;
 OFFSET_plat = [210; 330; 90] * pi / 180;
 
 % Offset góc khớp (từ RRResp.ino)
-% [GIU NGUYEN]
 offset_deg = [-19.49; 100.51; -139.49];
 
 %% ========== 2. THÔNG SỐ VẬT LÝ - CẦN ĐO ĐẠC ==========
-
-% ----------------------------------------------------------
-% [DO DAC] KHỐI LƯỢNG TỪNG KHÂU (kg)
-% Cách đo: dùng cân điện tử cân từng thanh khâu riêng lẻ
-% Hiện tại đang dùng: 100g = 0.1 kg (lấy từ Matlab.txt)
-% ----------------------------------------------------------
-m_link = 0.100;          % kg - THAY bằng giá trị cân được
-
-% ----------------------------------------------------------
-% [DO DAC] KHỐI LƯỢNG PLATFORM (kg)
-% Cách đo: cân toàn bộ tam giác platform + các khớp bị động
-% Hiện tại đang dùng: 100g = 0.1 kg
-% ----------------------------------------------------------
+m_link_chu_dong = 0.100;  % kg - khâu XANH (cân bằng cân điện tử)
+m_link_bi_dong  = 0.050;  % kg - khâu TRẮNG (thường nhẹ hơn)
 m_p = 0.100;             % kg - THAY bằng giá trị cân được
 
-% ----------------------------------------------------------
 % [DO DAC] MOMENT QUÁN TÍNH KHÂU I_link (kg.m²)
-% Công thức lý thuyết (thanh đồng nhất quay quanh đầu):
-%   I = (1/3)*m*L²
-% Cách đo thực tế (phương pháp dao động):
-%   1. Treo khâu bằng dây ở một đầu
-%   2. Cho dao động như con lắc vật lý
-%   3. Đo chu kỳ T (s)
-%   4. I = m*g*(L/2)*T²/(4*pi²)
-% Hiện tại dùng công thức lý thuyết:
-% ----------------------------------------------------------
-I_link = (1/3) * m_link * Lm^2;
-% I_link = ???;          % THAY nếu đã đo được
-
+I_chu_dong = (1/3) * m_link_chu_dong * Lm^2;
+I_bi_dong  = (1/3) * m_link_bi_dong  * Lm^2;
+% Tổng moment quán tính quy về khớp chủ động
+% (khâu bị động quy về qua Jacobian, xấp xỉ cộng trực tiếp)
+I_link = I_chu_dong + I_bi_dong;
 % ----------------------------------------------------------
 % [DO DAC] MA SÁT COULOMB (N.m)
 % Cách đo:
