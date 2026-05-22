@@ -1,0 +1,903 @@
+function Robot3RRR_DayDu
+% =========================================================
+%  ROBOT SONG SONG PHẲNG 3-RRR  –  BỘ ĐẦY ĐỦ
+%  Kết hợp:
+%    • Matlab.txt   : động học, kỳ dị, mô phỏng 3D/2D, sin/cos
+%    • matlab_dongluchoc.txt : động lực học M/C/G, CTC vs PID bậc 2
+%
+%  Robot NẰM NGANG (mặt phẳng XY) → G ≈ 0
+%
+%  Nhãn chú thích:
+%    [GIU NGUYEN] – không cần đổi
+%    [DO DAC]     – cần đo từ phần cứng thực
+%    [TUNING]     – chỉnh sau khi chạy thực tế
+% =========================================================
+
+clc; clear; close all;
+
+%% ══════════════════════════════════════════════════════════
+%% 1.  THAM SỐ HÌNH HỌC  [GIU NGUYEN]
+%% ══════════════════════════════════════════════════════════
+H       = 50;                       % cạnh tam giác cơ sở (cm)
+l       = 20;                       % chiều dài mỗi khâu (cm)
+m_plat  = (sqrt(3)/30)*H;           % G → đỉnh platform (cm)
+r_plat  = m_plat / sqrt(3);         % bán kính tâm (cm)
+
+% Đơn vị SI cho phần động lực học
+Lm  = l    / 100;                   % m
+rm  = r_plat / 100;                 % m
+
+% Tọa độ khớp cơ sở (cm)
+A1 = [0,   0];
+A2 = [H,   0];
+A3 = [H/2, (sqrt(3)/2)*H];
+A  = [A1; A2; A3];
+Am = A / 100;                       % m
+
+% Góc offset platform (rad)
+OFFSET_plat = [210; 330; 90] * pi/180;
+
+%% ══════════════════════════════════════════════════════════
+%% 2.  THAM SỐ VẬT LÝ
+%% ══════════════════════════════════════════════════════════
+% [GIU NGUYEN] – từ Matlab.txt gốc
+KL      = 100;          % khối lượng platform (g)
+m_seg   = 100;          % khối lượng mỗi khâu (g)
+w_arm   = 4;            % rộng khâu (cm)
+t_arm   = 0.5;          % dày khâu (cm)
+g_acc   = 981;          % gia tốc trọng trường (cm/s²)
+tau_max = 0.6;          % giới hạn moment động cơ (N.m)
+CPR     = 8192;         % xung/vòng encoder [GIU NGUYEN từ RRResp.ino]
+
+% Đổi sang kg
+m_link_kg = m_seg / 1000;
+m_p_kg    = KL   / 1000;
+
+% Moment quán tính khâu (kg.m²)
+I_link = (1/3) * m_link_kg * Lm^2;     % khâu chủ động
+I_bi   = (1/3) * (m_link_kg*0.5) * Lm^2; % khâu bị động (ước lượng nhẹ hơn)
+I_total = I_link + I_bi;               % tổng quy về khớp chủ động
+
+% [DO DAC] Ma sát Coulomb (N.m) – đo bằng lực kế × cánh tay đòn
+tau_friction = 0.005;
+
+% [DO DAC] Ma sát nhớt (N.m.s/rad) – đo moment tại nhiều tốc độ
+B_viscous = 0.001;
+
+% [DO DAC] Nhiễu encoder (rad) – log encoder lúc đứng yên 10s → tính std
+sigma_encoder = 1 * (2*pi / CPR);      % ≈ 0.00077 rad = 0.044°
+
+% RPM tối đa hiệu chỉnh theo khối lượng
+rpm_max_adj = 112 * sqrt(100/KL);
+
+% Robot NẰM NGANG → G ≈ 0
+%   (nếu đứng: thay bằng G_coeff*cos(q))
+calc_G = @(q) zeros(3,1);
+
+% Ma trận quán tính M (xấp xỉ hằng số)
+M_val  = 2*I_total + (1/3)*m_p_kg*Lm^2;
+calc_M = @(~) M_val * eye(3);
+
+% Coriolis C ≈ 0 (tốc độ thấp)
+calc_C = @(~,~) zeros(3,3);
+
+fprintf('=== THÔNG SỐ ROBOT 3-RRR ===\n');
+fprintf('[GIU NGUYEN] L=%g cm | H=%g cm | tau_max=%.1f N.m\n', l, H, tau_max);
+fprintf('[TINH]       I_total=%.6f kg.m² | M_val=%.6f kg.m²\n', I_total, M_val);
+fprintf('[DO DAC]     tau_friction=%.4f N.m | B_viscous=%.4f N.m.s/rad\n', tau_friction, B_viscous);
+fprintf('[DO DAC]     sigma_encoder=%.5f rad (%.4f°)\n', sigma_encoder, rad2deg(sigma_encoder));
+
+%% ══════════════════════════════════════════════════════════
+%% 3.  THÔNG SỐ BỘ ĐIỀU KHIỂN  [TUNING]
+%% ══════════════════════════════════════════════════════════
+% ── PID thường (quy đổi từ ESP32) ──────────────────────────
+scale   = CPR / (2*pi);             % xung/rad ≈ 1303.8
+kp_pid  = (3.5  / scale) * I_total * 1000;
+ki_pid  = (0.2  / scale) * I_total * 1000;
+kd_pid  = (0.035/ scale) * I_total * 1000;
+
+% ── CTC – Computed Torque Control ──────────────────────────
+% Cực vòng kín: s² + Kd·s + Kp = 0  →  s = -alpha ± j·beta
+% [TUNING] alpha=15 beta=10 → Kp=325, Kd=30
+alpha   = 15;
+beta    = 10;
+Kp_ctc  = (alpha^2 + beta^2) * eye(3);   % 325
+Kd_ctc  = 2 * alpha           * eye(3);  %  30
+Ki_ctc  = 5                   * eye(3);  %   5
+
+fprintf('\n=== BỘ ĐIỀU KHIỂN ===\n');
+fprintf('[QUY DOI] PID: Kp=%.5f | Ki=%.6f | Kd=%.7f (N.m/rad)\n', kp_pid, ki_pid, kd_pid);
+fprintf('[TUNING]  CTC: alpha=%d beta=%d → Kp=%.0f Kd=%.0f Ki=%.0f\n', ...
+    alpha, beta, Kp_ctc(1,1), Kd_ctc(1,1), Ki_ctc(1,1));
+
+%% ══════════════════════════════════════════════════════════
+%% 4.  CHỌN QUỸ ĐẠO
+%% ══════════════════════════════════════════════════════════
+fprintf('\n1=Đường thẳng  2=Tam giác  3=Hình vuông  4=Đường tròn\n');
+traj_choice = input('Chọn quỹ đạo (1-4): ');
+v_des       = input('Vận tốc (cm/s): ');
+
+x0_cm = H/2;
+y0_cm = (sqrt(3)/4)*H;
+n     = 200;
+
+switch traj_choice
+    case 1
+        xt = input('X đích (cm): ');
+        yt = input('Y đích (cm): ');
+        dist    = sqrt((xt-x0_cm)^2 + (yt-y0_cm)^2);
+        T_sim   = dist / v_des;
+        x_traj  = linspace(x0_cm, xt, n);
+        y_traj  = linspace(y0_cm, yt, n);
+
+    case 2
+        sl  = input('Cạnh tam giác (cm): ');
+        ang = [90,210,330]*pi/180;  r_tri = sl/sqrt(3);
+        nps = floor(n/3);  x_traj = [];  y_traj = [];
+        for i = 1:3
+            ni = mod(i,3)+1;
+            x_traj = [x_traj, linspace(x0_cm+r_tri*cos(ang(i)), x0_cm+r_tri*cos(ang(ni)), nps)]; %#ok
+            y_traj = [y_traj, linspace(y0_cm+r_tri*sin(ang(i)), y0_cm+r_tri*sin(ang(ni)), nps)]; %#ok
+        end
+        n = length(x_traj);  dist = 3*sl;  T_sim = dist/v_des;
+
+    case 3
+        sl  = input('Cạnh hình vuông (cm): ');
+        hs  = sl/2;
+        corn = [x0_cm-hs, y0_cm-hs; x0_cm+hs, y0_cm-hs;
+                x0_cm+hs, y0_cm+hs; x0_cm-hs, y0_cm+hs];
+        nps = floor(n/4);  x_traj = [];  y_traj = [];
+        for i = 1:4
+            ni = mod(i,4)+1;
+            x_traj = [x_traj, linspace(corn(i,1), corn(ni,1), nps)]; %#ok
+            y_traj = [y_traj, linspace(corn(i,2), corn(ni,2), nps)]; %#ok
+        end
+        n = length(x_traj);  dist = 4*sl;  T_sim = dist/v_des;
+
+    case 4
+        rc   = input('Bán kính (cm): ');
+        thc  = linspace(0, 2*pi, n);
+        x_traj = x0_cm + rc*cos(thc);
+        y_traj = y0_cm + rc*sin(thc);
+        dist = 2*pi*rc;  T_sim = dist/v_des;
+
+    otherwise
+        error('Lựa chọn không hợp lệ');
+end
+
+phi_traj    = zeros(1, n);
+T_vec       = linspace(0, T_sim, n);
+dt          = T_sim / (n-1);
+traj_names  = {'Đường thẳng','Tam giác','Hình vuông','Đường tròn'};
+
+fprintf('Quỹ đạo: %s | L=%.2f cm | T=%.2f s | n=%d\n', ...
+    traj_names{traj_choice}, dist, T_sim, n);
+
+%% ══════════════════════════════════════════════════════════
+%% 5.  NGHỊCH ĐỘNG HỌC → q_d (rad), dq_d, ddq_d
+%% ══════════════════════════════════════════════════════════
+x_m = x_traj / 100;   % cm → m
+y_m = y_traj / 100;
+
+q_d = zeros(n, 3);
+for k = 1:n
+    xP = x_m(k);  yP = y_m(k);
+    for i = 1:3
+        Ppx = xP + rm*cos(OFFSET_plat(i));
+        Ppy = yP + rm*sin(OFFSET_plat(i));
+        dx  = Ppx - Am(i,1);  dy = Ppy - Am(i,2);
+        d   = sqrt(dx^2 + dy^2);
+        if d <= 2*Lm && d > 1e-4
+            q_d(k,i) = atan2(dy,dx) - acos(d/(2*Lm));
+        elseif k > 1
+            q_d(k,i) = q_d(k-1,i);
+        end
+    end
+end
+
+dq_d  = zeros(n,3);
+ddq_d = zeros(n,3);
+for i = 1:3
+    dq_d(:,i)  = gradient(q_d(:,i),  dt);
+    ddq_d(:,i) = gradient(dq_d(:,i), dt);
+end
+
+%% ══════════════════════════════════════════════════════════
+%% 6.  BẢN ĐỒ KỲ DỊ
+%% ══════════════════════════════════════════════════════════
+fprintf('Đang tính bản đồ kỳ dị...\n');
+[X_grid, Y_grid] = meshgrid(linspace(-5,H+5,150), linspace(-5,H+5,150));
+det_map   = zeros(size(X_grid));
+sing_thr  = 1e-3;
+cond_thr  = 100;
+
+for ii = 1:size(X_grid,1)
+    for jj = 1:size(X_grid,2)
+        xP = X_grid(ii,jj);  yP = Y_grid(ii,jj);
+        Pg = [xP + m_plat*cos(210*pi/180), yP + m_plat*sin(210*pi/180);
+              xP + m_plat*cos(330*pi/180), yP + m_plat*sin(330*pi/180);
+              xP + m_plat*cos( 90*pi/180), yP + m_plat*sin( 90*pi/180)];
+        Jg  = zeros(3,3);  vld = true;
+        for k = 1:3
+            dx = Pg(k,1)-A(k,1);  dy = Pg(k,2)-A(k,2);
+            d  = sqrt(dx^2+dy^2);
+            if d > 2*l || d < 0.01, vld = false; break; end
+            th = atan2(dy,dx) - acos(d/(2*l));
+            Jg(k,1) = -l*sin(th);
+            Jg(k,2) =  l*cos(th);
+            Jg(k,3) = -l*sin(th)*(Pg(k,2)-yP) + l*cos(th)*(Pg(k,1)-xP);
+        end
+        if vld,  det_map(ii,jj) = abs(det(Jg));
+        else,    det_map(ii,jj) = NaN;
+        end
+    end
+end
+fprintf('Bản đồ kỳ dị: Hoàn thành\n');
+
+%% ══════════════════════════════════════════════════════════
+%% 7.  TÍNH TRƯỚC sin/cos ĐỂ VẼ ĐỒ THỊ TĨNH
+%% ══════════════════════════════════════════════════════════
+sin_pre = sin(q_d);
+cos_pre = cos(q_d);
+
+%% ══════════════════════════════════════════════════════════
+%% 8.  XÂY DỰNG GIAO DIỆN – FIGURE CHÍNH (Hình 1)
+%% ══════════════════════════════════════════════════════════
+fig1 = figure('Name','Robot 3-RRR | Mô Phỏng Đầy Đủ', ...
+    'NumberTitle','off', 'Color','white', ...
+    'Units','normalized', 'OuterPosition',[0 0 1 1]);
+
+% ─── layout ────────────────────────────────────────────────
+%  [bản đồ 2D | mô phỏng 3D           | moment CTC  | moment PID  ]
+%  [bảng thông| mô phỏng 3D           | sai số CTC  | sai số PID  ]
+%  [số real   | sin / cos góc khớp    | góc khớp    | tổng moment ]
+
+ax_2d   = axes('Position',[0.01  0.52  0.14  0.44]);  % bản đồ kỳ dị 2D
+ax_info = axes('Position',[0.01  0.02  0.14  0.45]);  % bảng thông số realtime
+ax_3d   = axes('Position',[0.17  0.34  0.28  0.57]);  % mô phỏng 3D
+ax_sin  = axes('Position',[0.17  0.04  0.13  0.27]);  % sin(theta)
+ax_cos  = axes('Position',[0.32  0.04  0.13  0.27]);  % cos(theta)
+
+% 2×2 panel bên phải: moment + sai số
+pos_r = [0.48 0.54 0.24 0.38;   % CTC moment
+         0.74 0.54 0.24 0.38;   % PID moment
+         0.48 0.08 0.24 0.38;   % CTC sai số
+         0.74 0.08 0.24 0.38];  % PID sai số
+ax_r = gobjects(4,1);
+for sp = 1:4
+    ax_r(sp) = axes('Position', pos_r(sp,:));
+end
+
+% ── Bản đồ kỳ dị 2D ──────────────────────────────────────
+axes(ax_2d); hold on; axis equal; grid on;
+axis([-10 H+10 -10 H+10]);
+xlabel('X (cm)'); ylabel('Y (cm)');
+title('Det Jacobian (log₁₀)', 'FontSize',10, 'FontWeight','bold');
+contourf(ax_2d, X_grid, Y_grid, log10(det_map+1e-10), 20, 'LineColor','none');
+colorbar(ax_2d); colormap(ax_2d, jet); clim([-3 1]);
+contour(ax_2d, X_grid, Y_grid, det_map, [sing_thr sing_thr], 'r-', 'LineWidth',2);
+plot(ax_2d, [A1(1) A2(1) A3(1) A1(1)], [A1(2) A2(2) A3(2) A1(2)], 'k-','LineWidth',2.5);
+text(ax_2d, A1(1)-3, A1(2)-3, 'A1','FontSize',9,'FontWeight','bold');
+text(ax_2d, A2(1)+1, A2(2)-3, 'A2','FontSize',9,'FontWeight','bold');
+text(ax_2d, A3(1),   A3(2)+2, 'A3','FontSize',9,'FontWeight','bold');
+plot(ax_2d, x_traj, y_traj, 'w-','LineWidth',2);
+plot(ax_2d, x_traj(1), y_traj(1), 'go','MarkerSize',9,'MarkerFaceColor','g');
+plot(ax_2d, x_traj(end), y_traj(end), 'r*','MarkerSize',12,'LineWidth',2);
+pt_G2d    = plot(ax_2d, nan, nan, 'wo','MarkerFaceColor','w','MarkerSize',7,'LineWidth',1.5);
+pt_plat2d = fill(ax_2d, nan, nan, 'c','FaceAlpha',0.5,'EdgeColor','w','LineWidth',1.5);
+h_link2d  = gobjects(3,1);
+for i = 1:3
+    h_link2d(i) = plot(ax_2d, nan, nan, 'y-','LineWidth',2.5);
+end
+
+% ── Mô phỏng 3D ──────────────────────────────────────────
+axes(ax_3d); hold on; axis equal; grid on;
+xlabel('X (cm)','FontSize',11); ylabel('Y (cm)','FontSize',11); zlabel('Z (cm)','FontSize',11);
+title('Mô Phỏng 3D Robot','FontSize',13,'FontWeight','bold');
+view(45,35); lighting gouraud; camlight('right'); camlight('left');
+set(ax_3d,'Color','white','GridColor',[0.75 0.75 0.75],'GridAlpha',0.5,'Box','on');
+axis(ax_3d,[-10 H+10 -10 H+10 -8 8]);
+
+[bx,by] = meshgrid(linspace(-5,H+5,2), linspace(-5,H+5,2));
+surf(ax_3d, bx, by, zeros(2)-2, 'FaceColor',[0.90 0.90 0.92],'EdgeColor','none','FaceAlpha',0.6);
+fill3(ax_3d, [A1(1) A2(1) A3(1) A1(1)], [A1(2) A2(2) A3(2) A1(2)], zeros(1,4)-1.5, ...
+    [0.75 0.75 0.78],'FaceAlpha',0.85,'EdgeColor',[0.2 0.2 0.2],'LineWidth',2);
+
+hw   = w_arm/2;  ht = t_arm/2;  n_cap = 14;  jr = hw*0.7;
+arm_col = [0.92 0.28 0.10; 0.10 0.72 0.28; 0.15 0.45 0.92];
+[sx,sy,sz] = sphere(16);
+
+h3d_links  = gobjects(3,2);
+h3d_caps1  = gobjects(3,2);
+h3d_caps2  = gobjects(3,2);
+h3d_joints = gobjects(3,2);
+
+h3d_plat = patch(ax_3d,'XData',[],'YData',[],'ZData',[], ...
+    'FaceColor',[0.0 0.65 0.85],'FaceAlpha',0.88, ...
+    'EdgeColor',[0.0 0.3 0.6],'LineWidth',2);
+h3d_ctr = plot3(ax_3d, nan,nan,nan,'o', ...
+    'MarkerFaceColor',[0.0 0.3 0.6],'MarkerEdgeColor','w','MarkerSize',9,'LineWidth',2);
+
+for i = 1:3
+    col  = arm_col(i,:);  cold = col*0.72;
+    [cx_t,cy_t,cz_t] = arm_body_surf([0 0 0],[1 0 0],hw,ht);
+    h3d_links(i,1) = surf(ax_3d,cx_t,cy_t,cz_t,'FaceColor',col, 'EdgeColor','none','FaceAlpha',1,'SpecularStrength',0.5);
+    h3d_links(i,2) = surf(ax_3d,cx_t,cy_t,cz_t,'FaceColor',cold,'EdgeColor','none','FaceAlpha',1,'SpecularStrength',0.5);
+    [cx_t,cy_t,cz_t] = arm_cap_arc([0 0 0],[1 0 0],-1,hw,ht,n_cap);
+    h3d_caps1(i,1) = surf(ax_3d,cx_t,cy_t,cz_t,'FaceColor',col, 'EdgeColor','none','FaceAlpha',1);
+    h3d_caps1(i,2) = surf(ax_3d,cx_t,cy_t,cz_t,'FaceColor',cold,'EdgeColor','none','FaceAlpha',1);
+    [cx_t,cy_t,cz_t] = arm_cap_arc([0 0 0],[1 0 0],+1,hw,ht,n_cap);
+    h3d_caps2(i,1) = surf(ax_3d,cx_t,cy_t,cz_t,'FaceColor',col, 'EdgeColor','none','FaceAlpha',1);
+    h3d_caps2(i,2) = surf(ax_3d,cx_t,cy_t,cz_t,'FaceColor',cold,'EdgeColor','none','FaceAlpha',1);
+    h3d_joints(i,1) = surf(ax_3d,sx*jr,sy*jr,sz*jr,'FaceColor',[0.88 0.88 0.90],'EdgeColor','none','FaceAlpha',1,'SpecularStrength',0.8);
+    h3d_joints(i,2) = surf(ax_3d,sx*jr,sy*jr,sz*jr,'FaceColor',[0.78 0.78 0.80],'EdgeColor','none','FaceAlpha',1,'SpecularStrength',0.8);
+    surf(ax_3d, sx*jr*1.3+A(i,1), sy*jr*1.3+A(i,2), sz*jr*1.3, ...
+        'FaceColor',col,'EdgeColor','none','FaceAlpha',1,'SpecularStrength',0.6);
+end
+
+% ── Đồ thị sin(theta) ────────────────────────────────────
+anim_col = [0.85 0.10 0.10; 0.10 0.65 0.20; 0.10 0.35 0.85];
+hold(ax_sin,'on'); grid(ax_sin,'on'); box(ax_sin,'on');
+title(ax_sin,'sin(θ) các khớp','FontSize',10,'FontWeight','bold');
+xlabel(ax_sin,'Thời gian (s)','FontSize',9); ylabel(ax_sin,'sin(θ)','FontSize',9);
+axis(ax_sin,[0 T_sim -1.15 1.15]);
+yline(ax_sin,  1,'--','Color',[0.8 0.8 0.8],'LineWidth',0.8,'HandleVisibility','off');
+yline(ax_sin, -1,'--','Color',[0.8 0.8 0.8],'LineWidth',0.8,'HandleVisibility','off');
+for i = 1:3
+    plot(ax_sin, T_vec, sin_pre(:,i), '-','Color',anim_col(i,:)*0.35+0.65, ...
+        'LineWidth',0.9,'DisplayName',sprintf('Khớp %d',i));
+end
+legend(ax_sin,'Location','best','FontSize',7,'Box','off');
+h_sin_pt = gobjects(3,1);
+for i = 1:3
+    h_sin_pt(i) = plot(ax_sin, T_vec(1), sin_pre(1,i), 'o', ...
+        'MarkerFaceColor',anim_col(i,:),'MarkerEdgeColor','w','MarkerSize',7,'HandleVisibility','off');
+end
+
+% ── Đồ thị cos(theta) ────────────────────────────────────
+hold(ax_cos,'on'); grid(ax_cos,'on'); box(ax_cos,'on');
+title(ax_cos,'cos(θ) các khớp','FontSize',10,'FontWeight','bold');
+xlabel(ax_cos,'Thời gian (s)','FontSize',9); ylabel(ax_cos,'cos(θ)','FontSize',9);
+axis(ax_cos,[0 T_sim -1.15 1.15]);
+yline(ax_cos,  1,'--','Color',[0.8 0.8 0.8],'LineWidth',0.8,'HandleVisibility','off');
+yline(ax_cos, -1,'--','Color',[0.8 0.8 0.8],'LineWidth',0.8,'HandleVisibility','off');
+for i = 1:3
+    plot(ax_cos, T_vec, cos_pre(:,i), '--','Color',anim_col(i,:)*0.35+0.65, ...
+        'LineWidth',0.9,'DisplayName',sprintf('Khớp %d',i));
+end
+legend(ax_cos,'Location','best','FontSize',7,'Box','off');
+h_cos_pt = gobjects(3,1);
+for i = 1:3
+    h_cos_pt(i) = plot(ax_cos, T_vec(1), cos_pre(1,i), 's', ...
+        'MarkerFaceColor',anim_col(i,:),'MarkerEdgeColor','w','MarkerSize',7,'HandleVisibility','off');
+end
+
+% ── 4 panel phải: CTC moment | PID moment | CTC sai số | PID sai số ──
+panel_titles = {'Moment – CTC (mN.m)','Moment – PID thường (mN.m)', ...
+                'Sai số góc – CTC (°)','Sai số góc – PID (°)'};
+panel_ylabs  = {'τ (mN.m)','τ (mN.m)','e (°)','e (°)'};
+ln_r  = gobjects(4,3);
+pt_r  = gobjects(4,3);
+for sp = 1:4
+    hold(ax_r(sp),'on'); grid(ax_r(sp),'on'); box(ax_r(sp),'on');
+    title(ax_r(sp), panel_titles{sp},'FontSize',9,'FontWeight','bold');
+    xlabel(ax_r(sp),'Thời gian (s)','FontSize',8);
+    ylabel(ax_r(sp), panel_ylabs{sp},'FontSize',8);
+    set(ax_r(sp),'FontSize',8);
+    for i = 1:3
+        ln_r(sp,i) = plot(ax_r(sp), nan, nan, '-', ...
+            'Color',anim_col(i,:),'LineWidth',1.5,'DisplayName',sprintf('Khớp %d',i));
+    end
+    if sp <= 2
+        yline(ax_r(sp),  tau_max*1000,'r--','LineWidth',1.2,'HandleVisibility','off');
+        yline(ax_r(sp), -tau_max*1000,'r--','LineWidth',1.2,'HandleVisibility','off');
+    else
+        yline(ax_r(sp), 0,'k--','LineWidth',0.8,'HandleVisibility','off');
+    end
+    legend(ax_r(sp),'Location','best','FontSize',7,'Box','off');
+    for i = 1:3
+        pt_r(sp,i) = plot(ax_r(sp), nan, nan, 'o', ...
+            'MarkerFaceColor',anim_col(i,:),'MarkerEdgeColor','w','MarkerSize',6,'HandleVisibility','off');
+    end
+end
+
+sgtitle(fig1, sprintf('Robot 3-RRR Đầy Đủ | Quỹ đạo: %s | v=%.1f cm/s | T=%.2f s', ...
+    traj_names{traj_choice}, v_des, T_sim), 'FontSize',12,'FontWeight','bold');
+axis(ax_info,'off');
+
+%% ══════════════════════════════════════════════════════════
+%% 9.  KHỞI TẠO TRẠNG THÁI ĐỘNG LỰC HỌC
+%% ══════════════════════════════════════════════════════════
+q_pid  = q_d(1,:)';   dq_pid  = zeros(3,1);
+q_ctc  = q_d(1,:)';   dq_ctc  = zeros(3,1);
+I_err_pid = zeros(3,1);
+I_err_ctc = zeros(3,1);
+e_prev_pid = zeros(3,1);
+rng(42);   % seed cố định để tái hiện được
+
+% Mảng log kết quả
+tau_pid_log = zeros(n,3);
+tau_ctc_log = zeros(n,3);
+e_pid_log   = zeros(n,3);
+e_ctc_log   = zeros(n,3);
+q_pid_log   = zeros(n,3);
+q_ctc_log   = zeros(n,3);
+q_pid_log(1,:) = q_pid';
+q_ctc_log(1,:) = q_ctc';
+
+% Mảng cho phần động học gốc
+theta_all     = zeros(n,3);
+det_J_all     = zeros(n,1);
+cond_J_all    = zeros(n,1);
+singularity_flag = zeros(n,1);
+near_sing_flag   = zeros(n,1);
+v_mag            = zeros(n,1);
+rpm_all          = zeros(n,3);
+rpm_over_flag    = zeros(n,3);
+
+%% ══════════════════════════════════════════════════════════
+%% 10.  VÒNG LẶP MÔ PHỎNG CHÍNH
+%% ══════════════════════════════════════════════════════════
+fprintf('\n=== BẮT ĐẦU MÔ PHỎNG ===\n');
+
+for k = 1:n
+    xP  = x_traj(k);   yP  = y_traj(k);   phi = phi_traj(k);
+    t_k = (k-1) * dt;
+
+    % ── Vị trí 3 điểm nối platform (cm) ──────────────────
+    P1  = [xP + m_plat*cos(phi+210*pi/180), yP + m_plat*sin(phi+210*pi/180)];
+    P2  = [xP + m_plat*cos(phi+330*pi/180), yP + m_plat*sin(phi+330*pi/180)];
+    P3  = [xP + m_plat*cos(phi+ 90*pi/180), yP + m_plat*sin(phi+ 90*pi/180)];
+    P   = [P1; P2; P3];
+
+    % ── Jacobian + góc khớp (cm) ──────────────────────────
+    theta  = zeros(1,3);
+    J_kin  = zeros(3,3);
+    J_pos  = zeros(3,2);
+    ok     = true;
+    for i = 1:3
+        dx = P(i,1)-A(i,1);  dy = P(i,2)-A(i,2);
+        d  = sqrt(dx^2+dy^2);
+        if d > 2*l || d < 0.01, ok = false; break; end
+        al = atan2(dy,dx);  be = acos(d/(2*l));
+        theta(i)    = al - be;
+        J_pos(i,:)  = [A(i,1)+l*cos(theta(i)), A(i,2)+l*sin(theta(i))];
+        J_kin(i,1)  = -l*sin(theta(i));
+        J_kin(i,2)  =  l*cos(theta(i));
+        J_kin(i,3)  = -l*sin(theta(i))*(P(i,2)-yP) + l*cos(theta(i))*(P(i,1)-xP);
+    end
+    if ~ok, continue; end
+
+    theta_all(k,:) = theta;
+    dJ = abs(det(J_kin));   det_J_all(k)  = dJ;
+    cond_J_all(k)  = ternval(dJ > 1e-10, cond(J_kin), Inf);
+    if dJ < sing_thr,      singularity_flag(k) = 1; end
+    if cond_J_all(k) > cond_thr, near_sing_flag(k) = 1; end
+
+    % ── Vận tốc trung điểm ────────────────────────────────
+    if k > 1 && k < n
+        vx = (x_traj(k+1)-x_traj(k-1))/(2*dt);
+        vy = (y_traj(k+1)-y_traj(k-1))/(2*dt);
+    elseif k == 1
+        vx = (x_traj(2)-x_traj(1))/dt;
+        vy = (y_traj(2)-y_traj(1))/dt;
+    else
+        vx = (x_traj(end)-x_traj(end-1))/dt;
+        vy = (y_traj(end)-y_traj(end-1))/dt;
+    end
+    v_mag(k) = sqrt(vx^2+vy^2);
+
+    % RPM từ sai phân góc
+    if k > 1
+        omega = (theta_all(k,:) - theta_all(k-1,:)) / dt;
+        rpm_all(k,:) = abs(omega)*60/(2*pi);
+        rpm_over_flag(k,:) = rpm_all(k,:) > rpm_max_adj;
+    end
+
+    % ── Động lực học – CTC & PID ─────────────────────────
+    if k > 1
+        q_ref   = q_d(k,:)';
+        dq_ref  = dq_d(k,:)';
+        ddq_ref = ddq_d(k,:)';
+
+        % Nhiễu encoder
+        noise_pid = sigma_encoder * randn(3,1);
+        noise_ctc = sigma_encoder * randn(3,1);
+
+        q_meas_pid = q_pid + noise_pid;
+        q_meas_ctc = q_ctc + noise_ctc;
+
+        % ── PID thường ──────────────────────────────────
+        e_pid      = q_ref - q_meas_pid;
+        I_err_pid  = I_err_pid + e_pid * dt;
+        de_pid     = (e_pid - e_prev_pid) / dt;
+        e_prev_pid = e_pid;
+
+        tau_pid    = kp_pid*e_pid + ki_pid*I_err_pid + kd_pid*de_pid;
+        tau_pid    = sign(tau_pid) .* min(abs(tau_pid), tau_max);
+
+        friction_p = tau_friction*sign(dq_pid) + B_viscous*dq_pid;
+        M_k        = calc_M(q_pid);
+        G_k        = calc_G(q_pid);
+        ddq_pid    = M_k \ (tau_pid - G_k - friction_p);
+        dq_pid     = dq_pid + ddq_pid * dt;
+        q_pid      = q_pid  + dq_pid  * dt;
+
+        % ── CTC (Computed Torque Control) ───────────────
+        e_ctc      = q_ref - q_meas_ctc;
+        I_err_ctc  = I_err_ctc + e_ctc * dt;
+        de_ctc     = dq_ref - dq_ctc;
+        a_des      = ddq_ref + Kd_ctc*de_ctc + Kp_ctc*e_ctc + Ki_ctc*I_err_ctc;
+
+        M_c        = calc_M(q_ctc);
+        C_c        = calc_C(q_ctc, dq_ctc);
+        G_c        = calc_G(q_ctc);
+        tau_ctc    = M_c*a_des + C_c*dq_ctc + G_c;
+        tau_ctc    = sign(tau_ctc) .* min(abs(tau_ctc), tau_max);
+
+        friction_c = tau_friction*sign(dq_ctc) + B_viscous*dq_ctc;
+        ddq_ctc    = M_c \ (tau_ctc - C_c*dq_ctc - G_c - friction_c);
+        dq_ctc     = dq_ctc + ddq_ctc * dt;
+        q_ctc      = q_ctc  + dq_ctc  * dt;
+
+        % Log
+        q_pid_log(k,:)   = q_pid';
+        q_ctc_log(k,:)   = q_ctc';
+        tau_pid_log(k,:) = tau_pid';
+        tau_ctc_log(k,:) = tau_ctc';
+        e_pid_log(k,:)   = e_pid';
+        e_ctc_log(k,:)   = e_ctc';
+    end
+
+    % ── Cập nhật 2D ─────────────────────────────────────
+    for i = 1:3
+        set(h_link2d(i),'XData',[A(i,1) J_pos(i,1) P(i,1)], ...
+                         'YData',[A(i,2) J_pos(i,2) P(i,2)]);
+    end
+    set(pt_plat2d,'XData',[P1(1) P2(1) P3(1)],'YData',[P1(2) P2(2) P3(2)]);
+    set(pt_G2d,'XData',xP,'YData',yP);
+
+    % ── Cập nhật 3D ─────────────────────────────────────
+    za = 0;
+    for i = 1:3
+        Ex = J_pos(i,1);  Ey = J_pos(i,2);
+        Px_i = P(i,1);    Py_i = P(i,2);
+        ptA  = [A(i,1), A(i,2), za];
+        ptE  = [Ex, Ey, za];
+        ptPi = [Px_i, Py_i, za];
+
+        [cx_t,cy_t,cz_t] = arm_body_surf(ptA, ptE, hw, ht);
+        set(h3d_links(i,1),'XData',cx_t,'YData',cy_t,'ZData',cz_t);
+        [cx_t,cy_t,cz_t] = arm_cap_arc(ptA, ptE, -1, hw, ht, n_cap);
+        set(h3d_caps1(i,1),'XData',cx_t,'YData',cy_t,'ZData',cz_t);
+        [cx_t,cy_t,cz_t] = arm_cap_arc(ptA, ptE, +1, hw, ht, n_cap);
+        set(h3d_caps2(i,1),'XData',cx_t,'YData',cy_t,'ZData',cz_t);
+
+        [cx_t,cy_t,cz_t] = arm_body_surf(ptE, ptPi, hw, ht);
+        set(h3d_links(i,2),'XData',cx_t,'YData',cy_t,'ZData',cz_t);
+        [cx_t,cy_t,cz_t] = arm_cap_arc(ptE, ptPi, -1, hw, ht, n_cap);
+        set(h3d_caps1(i,2),'XData',cx_t,'YData',cy_t,'ZData',cz_t);
+        [cx_t,cy_t,cz_t] = arm_cap_arc(ptE, ptPi, +1, hw, ht, n_cap);
+        set(h3d_caps2(i,2),'XData',cx_t,'YData',cy_t,'ZData',cz_t);
+
+        [sx2,sy2,sz2] = sphere(12);
+        set(h3d_joints(i,1),'XData',sx2*jr+Ex,   'YData',sy2*jr+Ey,   'ZData',sz2*jr+za);
+        set(h3d_joints(i,2),'XData',sx2*jr+Px_i, 'YData',sy2*jr+Py_i, 'ZData',sz2*jr+za);
+    end
+    set(h3d_plat,'XData',[P1(1) P2(1) P3(1)], ...
+                 'YData',[P1(2) P2(2) P3(2)],'ZData',[za za za]);
+    set(h3d_ctr,'XData',xP,'YData',yP,'ZData',za);
+
+    % ── Cập nhật sin/cos ─────────────────────────────────
+    for i = 1:3
+        h_sin_pt(i).XData = t_k;  h_sin_pt(i).YData = sin(theta(i));
+        h_cos_pt(i).XData = t_k;  h_cos_pt(i).YData = cos(theta(i));
+    end
+
+    % ── Cập nhật 4 panel CTC/PID ─────────────────────────
+    if k > 1
+        for i = 1:3
+            % CTC moment
+            ln_r(1,i).XData = [ln_r(1,i).XData, t_k];
+            ln_r(1,i).YData = [ln_r(1,i).YData, tau_ctc_log(k,i)*1000];
+            pt_r(1,i).XData = t_k;  pt_r(1,i).YData = tau_ctc_log(k,i)*1000;
+            % PID moment
+            ln_r(2,i).XData = [ln_r(2,i).XData, t_k];
+            ln_r(2,i).YData = [ln_r(2,i).YData, tau_pid_log(k,i)*1000];
+            pt_r(2,i).XData = t_k;  pt_r(2,i).YData = tau_pid_log(k,i)*1000;
+            % CTC sai số
+            ln_r(3,i).XData = [ln_r(3,i).XData, t_k];
+            ln_r(3,i).YData = [ln_r(3,i).YData, rad2deg(e_ctc_log(k,i))];
+            pt_r(3,i).XData = t_k;  pt_r(3,i).YData = rad2deg(e_ctc_log(k,i));
+            % PID sai số
+            ln_r(4,i).XData = [ln_r(4,i).XData, t_k];
+            ln_r(4,i).YData = [ln_r(4,i).YData, rad2deg(e_pid_log(k,i))];
+            pt_r(4,i).XData = t_k;  pt_r(4,i).YData = rad2deg(e_pid_log(k,i));
+        end
+    end
+
+    % ── Bảng thông số realtime ────────────────────────────
+    ss = 'OK – An toàn';  sc = [0 0.55 0];
+    if singularity_flag(k), ss = '⚠ KỲ DỊ!';        sc = [0.85 0 0];    end
+    if near_sing_flag(k),   ss = '⚠ GẦN KỲ DỊ!';    sc = [0.9 0.45 0];  end
+    rs = 'RPM: OK';  rc_ = [0 0.55 0];
+    if any(rpm_over_flag(k,:)), rs = 'RPM: QUÁ TẢI!'; rc_ = [0.85 0 0]; end
+
+    rms_pid_k = sqrt(mean(e_pid_log(1:k,:).^2, 'all'));
+    rms_ctc_k = sqrt(mean(e_ctc_log(1:k,:).^2, 'all'));
+    improve_k = ternval(rms_pid_k > 1e-10, (1-rms_ctc_k/rms_pid_k)*100, 0);
+
+    info = sprintf([...
+        'Bước: %d/%d  t=%.2fs\n\n'...
+        'Vị trí:\n  X=%.2f  Y=%.2f cm\n\n'...
+        'Góc khớp:\n  θ₁=%.2f°\n  θ₂=%.2f°\n  θ₃=%.2f°\n\n'...
+        'Vận tốc: %.2f cm/s\n\n'...
+        'RPM:\n  M1:%.1f  M2:%.1f  M3:%.1f\n\n'...
+        'Moment CTC (mN.m):\n  %.3f  %.3f  %.3f\n\n'...
+        'Moment PID (mN.m):\n  %.3f  %.3f  %.3f\n\n'...
+        'Sai số RMS (°):\n  CTC: %.4f\n  PID: %.4f\n  ↑ %.1f%%\n\n'...
+        'Jacobian:\n  det=%.5f\n  cond=%.2f'], ...
+        k, n, t_k, xP, yP, ...
+        rad2deg(theta(1)), rad2deg(theta(2)), rad2deg(theta(3)), v_mag(k), ...
+        rpm_all(k,1), rpm_all(k,2), rpm_all(k,3), ...
+        tau_ctc_log(k,1)*1000, tau_ctc_log(k,2)*1000, tau_ctc_log(k,3)*1000, ...
+        tau_pid_log(k,1)*1000, tau_pid_log(k,2)*1000, tau_pid_log(k,3)*1000, ...
+        rad2deg(rms_ctc_k), rad2deg(rms_pid_k), improve_k, ...
+        det_J_all(k), cond_J_all(k));
+
+    cla(ax_info);
+    text(ax_info, 0.05, 0.99, info, 'VerticalAlignment','top', ...
+        'FontSize',7.5,'Units','normalized','FontName','FixedWidth');
+    text(ax_info, 0.50, 0.11, ss, 'VerticalAlignment','middle', ...
+        'HorizontalAlignment','center','FontSize',11,'FontWeight','bold', ...
+        'Color',sc,'Units','normalized');
+    text(ax_info, 0.50, 0.04, rs, 'VerticalAlignment','middle', ...
+        'HorizontalAlignment','center','FontSize',10,'FontWeight','bold', ...
+        'Color',rc_,'Units','normalized');
+    axis(ax_info,'off');
+
+    drawnow limitrate;
+    pause(0.006);
+end
+
+fprintf('=== MÔ PHỎNG HOÀN THÀNH ===\n');
+
+%% ══════════════════════════════════════════════════════════
+%% 11.  CHỈNH TRỤC Y SAU KHI CÓ ĐỦ DỮ LIỆU
+%% ══════════════════════════════════════════════════════════
+for sp = 1:2   % moment panels
+    ymax = max([max(abs([tau_ctc_log(:); tau_pid_log(:)]))*1000*1.25, tau_max*1000*1.1]);
+    ylim(ax_r(sp), [-ymax, ymax]);
+    if any(singularity_flag)
+        si = find(singularity_flag);
+        dat = ternval(sp==1, tau_ctc_log, tau_pid_log);
+        plot(ax_r(sp), T_vec(si), dat(si,1)*1000, 'kx','MarkerSize',6,'LineWidth',1.5,'HandleVisibility','off');
+    end
+end
+for sp = 3:4   % sai số panels
+    dat = ternval(sp==3, e_ctc_log, e_pid_log);
+    ymax = max(abs(rad2deg(dat(:))))*1.25;
+    if ymax < 0.01, ymax = 0.5; end
+    ylim(ax_r(sp), [-ymax, ymax]);
+end
+drawnow;
+
+%% ══════════════════════════════════════════════════════════
+%% 12.  KẾT QUẢ CONSOLE
+%% ══════════════════════════════════════════════════════════
+vi = find(det_J_all ~= 0);
+rms_pid_tot = sqrt(mean(e_pid_log(:).^2));
+rms_ctc_tot = sqrt(mean(e_ctc_log(:).^2));
+tau_pid_max = max(abs(tau_pid_log));
+tau_ctc_max = max(abs(tau_ctc_log));
+
+fprintf('\n══════ KẾT QUẢ TỔNG HỢP ══════\n');
+fprintf('Tổng bước: %d | Hợp lệ: %d (%.1f%%)\n', n, length(vi), 100*length(vi)/n);
+fprintf('Kỳ dị    : %d (%.1f%%)\n', sum(singularity_flag), 100*sum(singularity_flag)/n);
+fprintf('Gần kỳ dị: %d (%.1f%%)\n', sum(near_sing_flag),   100*sum(near_sing_flag)/n);
+if ~isempty(vi)
+    fprintf('det(J): min=%.5f  max=%.5f  tb=%.5f\n', ...
+        min(det_J_all(vi)), max(det_J_all(vi)), mean(det_J_all(vi)));
+end
+
+fprintf('\n── So sánh động lực học ──\n');
+fprintf('%-20s %10s %10s %10s %10s\n','','Khớp 1','Khớp 2','Khớp 3','Tổng');
+fprintf('%-20s %10.5f %10.5f %10.5f %10.5f\n','RMS PID (rad)', ...
+    sqrt(mean(e_pid_log(:,1).^2)), sqrt(mean(e_pid_log(:,2).^2)), sqrt(mean(e_pid_log(:,3).^2)), rms_pid_tot);
+fprintf('%-20s %10.5f %10.5f %10.5f %10.5f\n','RMS CTC (rad)', ...
+    sqrt(mean(e_ctc_log(:,1).^2)), sqrt(mean(e_ctc_log(:,2).^2)), sqrt(mean(e_ctc_log(:,3).^2)), rms_ctc_tot);
+fprintf('%-20s %10.4f %10.4f %10.4f\n','τ max PID (N.m)', tau_pid_max(1), tau_pid_max(2), tau_pid_max(3));
+fprintf('%-20s %10.4f %10.4f %10.4f\n','τ max CTC (N.m)', tau_ctc_max(1), tau_ctc_max(2), tau_ctc_max(3));
+fprintf('Cải thiện RMS CTC vs PID: %.1f%%\n', (1-rms_ctc_tot/rms_pid_tot)*100);
+
+for i = 1:3
+    if any(tau_pid_log(:,i) > tau_max) || any(tau_ctc_log(:,i) > tau_max)
+        fprintf('⚠  Khớp %d: có thời điểm vượt tau_max\n', i);
+    else
+        fprintf('✓  Khớp %d: moment trong giới hạn\n', i);
+    end
+end
+
+%% ══════════════════════════════════════════════════════════
+%% 13.  HÌNH 2 – PHÂN TÍCH TỔNG HỢP CTC vs PID
+%% ══════════════════════════════════════════════════════════
+fig2 = figure('Name','Phân Tích Tổng Hợp – CTC vs PID', ...
+    'NumberTitle','off','Color','white', ...
+    'Units','normalized','OuterPosition',[0.05 0.05 0.90 0.90]);
+
+col_ctc2 = [0.10 0.45 0.85];
+col_pid2 = [0.85 0.15 0.15];
+col_ref2 = [0.10 0.10 0.10];
+kn = {'Khớp 1','Khớp 2','Khớp 3'};
+
+% Hàng 1: Góc khớp (tham chiếu vs CTC vs PID)
+for i = 1:3
+    ax = subplot(3,3,i); hold on; grid on; box on;
+    plot(T_vec, rad2deg(q_d(:,i)),      '--','Color',col_ref2,'LineWidth',1.5,'DisplayName','Tham chiếu');
+    plot(T_vec, rad2deg(q_ctc_log(:,i)),'-', 'Color',col_ctc2,'LineWidth',1.8,'DisplayName','CTC');
+    plot(T_vec, rad2deg(q_pid_log(:,i)),'-', 'Color',col_pid2,'LineWidth',1.8,'DisplayName','PID');
+    title(sprintf('%s – Góc khớp',kn{i}),'FontWeight','bold');
+    xlabel('t (s)'); ylabel('θ (°)');
+    if i==1, legend('Location','best','FontSize',8); end
+    set(ax,'FontSize',9);
+end
+
+% Hàng 2: Sai số
+for i = 1:3
+    ax = subplot(3,3,3+i); hold on; grid on; box on;
+    plot(T_vec, rad2deg(e_ctc_log(:,i)),'-','Color',col_ctc2,'LineWidth',1.8,'DisplayName','CTC');
+    plot(T_vec, rad2deg(e_pid_log(:,i)),'-','Color',col_pid2,'LineWidth',1.8,'DisplayName','PID');
+    yline(0,'k--','LineWidth',0.8,'HandleVisibility','off');
+    title(sprintf('%s – Sai số',kn{i}),'FontWeight','bold');
+    xlabel('t (s)'); ylabel('e (°)');
+    text(0.02,0.93,sprintf('RMS CTC=%.4f°  PID=%.4f°', ...
+        rad2deg(sqrt(mean(e_ctc_log(:,i).^2))), ...
+        rad2deg(sqrt(mean(e_pid_log(:,i).^2)))), ...
+        'Units','normalized','FontSize',7.5,'Color',[0.3 0.3 0.3]);
+    if i==1, legend('Location','best','FontSize',8); end
+    set(ax,'FontSize',9);
+end
+
+% Hàng 3: Moment
+for i = 1:3
+    ax = subplot(3,3,6+i); hold on; grid on; box on;
+    plot(T_vec, tau_ctc_log(:,i)*1000,'-','Color',col_ctc2,'LineWidth',1.8,'DisplayName','CTC');
+    plot(T_vec, tau_pid_log(:,i)*1000,'-','Color',col_pid2,'LineWidth',1.8,'DisplayName','PID');
+    yline( tau_max*1000,'r--','LineWidth',1,'HandleVisibility','off');
+    yline(-tau_max*1000,'r--','LineWidth',1,'HandleVisibility','off');
+    title(sprintf('%s – Moment',kn{i}),'FontWeight','bold');
+    xlabel('t (s)'); ylabel('τ (mN.m)');
+    text(0.02,0.93,sprintf('max CTC=%.1f  PID=%.1f mN.m', ...
+        tau_ctc_max(i)*1000, tau_pid_max(i)*1000), ...
+        'Units','normalized','FontSize',7.5,'Color',[0.3 0.3 0.3]);
+    if i==1, legend('Location','best','FontSize',8); end
+    set(ax,'FontSize',9);
+end
+
+sgtitle(fig2, sprintf('Phân Tích CTC vs PID | %s | v=%.1f cm/s | Cải thiện: %.1f%%', ...
+    traj_names{traj_choice}, v_des, (1-rms_ctc_tot/rms_pid_tot)*100), ...
+    'FontSize',12,'FontWeight','bold');
+
+%% ══════════════════════════════════════════════════════════
+%% 14.  HÌNH 3 – BẢNG TỔNG KẾT + HƯỚNG DẪN ĐO ĐẠC
+%% ══════════════════════════════════════════════════════════
+fig3 = figure('Name','Bảng Tổng Kết & Hướng Dẫn', ...
+    'NumberTitle','off','Color','white', ...
+    'Units','normalized','OuterPosition',[0.08 0.08 0.84 0.84]);
+
+ax_sum = axes('Position',[0.02 0.36 0.96 0.58]); axis off;
+xlim([0 1]); ylim([0 1]);
+
+hdrs = {'Chỉ số','PID Thường','CTC Bậc 2','Cải thiện'};
+improve_rms = (1-rms_ctc_tot/rms_pid_tot)*100;
+rows_tbl = {
+    'RMS tổng (°)',        sprintf('%.4f', rad2deg(rms_pid_tot)), sprintf('%.4f', rad2deg(rms_ctc_tot)),  sprintf('%.1f%%', improve_rms);
+    'τ max K1 (mN.m)',     sprintf('%.2f', tau_pid_max(1)*1000),  sprintf('%.2f', tau_ctc_max(1)*1000),  '–';
+    'τ max K2 (mN.m)',     sprintf('%.2f', tau_pid_max(2)*1000),  sprintf('%.2f', tau_ctc_max(2)*1000),  '–';
+    'τ max K3 (mN.m)',     sprintf('%.2f', tau_pid_max(3)*1000),  sprintf('%.2f', tau_ctc_max(3)*1000),  '–';
+    'Kp',                  sprintf('%.5f', kp_pid),                sprintf('%.0f', Kp_ctc(1,1)),           '–';
+    'Ki',                  sprintf('%.6f', ki_pid),                sprintf('%.0f', Ki_ctc(1,1)),           '–';
+    'Kd',                  sprintf('%.7f', kd_pid),                sprintf('%.0f', Kd_ctc(1,1)),           '–';
+    'tau_friction (N.m)',  sprintf('%.4f', tau_friction),          '[DO DAC]',                             '–';
+    'sigma encoder (°)',   sprintf('%.4f', rad2deg(sigma_encoder)),'[DO DAC]',                             '–';
+};
+
+col_x  = [0.00, 0.28, 0.54, 0.78];
+row_h  = 0.085;
+n_rows = size(rows_tbl,1);
+row_tops = linspace(0.97, 0.97 - row_h*n_rows, n_rows+1);
+
+hdr_bg = [0.15 0.35 0.65];
+for c = 1:4
+    rectangle(ax_sum,'Position',[col_x(c), row_tops(1)-row_h, 0.235, row_h-0.01], ...
+        'FaceColor',hdr_bg,'EdgeColor','white','LineWidth',1.5);
+    text(ax_sum, col_x(c)+0.117, row_tops(1)-row_h/2, hdrs{c}, ...
+        'HorizontalAlignment','center','FontSize',10,'FontWeight','bold','Color','white');
+end
+for r = 1:n_rows
+    bg = ternval(mod(r,2)==0, [0.90 0.94 1.00], [0.82 0.89 0.98]);
+    for c = 1:4
+        rectangle(ax_sum,'Position',[col_x(c), row_tops(r+1)-row_h, 0.235, row_h-0.01], ...
+            'FaceColor',bg,'EdgeColor','white','LineWidth',1);
+        fc = [0.1 0.1 0.1];
+        if c==4 && ~strcmp(rows_tbl{r,4},'–'), fc = [0.0 0.50 0.20]; end
+        if strcmp(rows_tbl{r,c},'[DO DAC]'),   fc = [0.75 0.30 0.0]; end
+        text(ax_sum, col_x(c)+0.117, row_tops(r+1)-row_h/2, rows_tbl{r,c}, ...
+            'HorizontalAlignment','center','FontSize',9,'Color',fc);
+    end
+end
+title(ax_sum, sprintf('Bảng Tổng Kết | %s | v=%.1f cm/s | T=%.2f s', ...
+    traj_names{traj_choice}, v_des, T_sim), 'FontSize',12,'FontWeight','bold');
+
+% Hướng dẫn đo đạc
+ax_guide = axes('Position',[0.02 0.02 0.96 0.30]); axis off;
+xlim([0 1]); ylim([0 1]);
+rectangle(ax_guide,'Position',[0 0 1 1],'FaceColor',[0.96 0.97 1.0],'EdgeColor',[0.65 0.72 0.88],'LineWidth',1.5);
+text(ax_guide, 0.5, 0.97, 'HƯỚNG DẪN ĐO ĐẠC THỰC TẾ [DO DAC]', ...
+    'HorizontalAlignment','center','FontSize',11,'FontWeight','bold','Color',[0.15 0.30 0.60],'VerticalAlignment','top');
+guides = {
+    '1. m_link / m_p  : Cân từng khâu & platform bằng cân điện tử (g)';
+    '2. I_link        : Phương pháp dao động con lắc đơn → T=2π√(I/mgL) → I = mgLT²/(4π²)';
+    '3. tau_friction  : Kéo khâu bằng lực kế ở tốc độ rất chậm → τ_f = F × L_moment';
+    '4. B_viscous     : Đo moment giữ tốc độ tại 3–5 tốc độ khác nhau → hệ số góc đường thẳng τ vs ω';
+    '5. sigma_encoder : Giữ robot đứng yên, log encoder 10 giây → std(data) × 2π/CPR (rad)';
+    '6. alpha / beta  : Sau khi có M,G,B chính xác → chỉnh để ω_n < ω_max_motor = RPM_max×2π/60';
+};
+for gi = 1:numel(guides)
+    text(ax_guide, 0.02, 0.82-(gi-1)*0.135, guides{gi}, ...
+        'FontSize',9,'FontName','FixedWidth','Color',[0.15 0.15 0.15],'VerticalAlignment','top');
+end
+
+fprintf('\n=== HOÀN THÀNH – Đã tạo 3 hình ===\n');
+fprintf('Hình 1: Mô phỏng realtime đầy đủ (3D + 2D + sin/cos + CTC/PID)\n');
+fprintf('Hình 2: So sánh chi tiết CTC vs PID (góc, sai số, moment)\n');
+fprintf('Hình 3: Bảng tổng kết + hướng dẫn đo đạc thực tế\n');
+
+end  % ═══ KẾT THÚC HÀM CHÍNH ═══════════════════════════
+
+%% ══════════════════════════════════════════════════════════
+%%  HÀM PHỤ TRỢ  (giữ nguyên từ Matlab.txt gốc)
+%% ══════════════════════════════════════════════════════════
+
+function [Xc,Yc,Zc] = arm_body_surf(p1, p2, hw, ht)
+    vec = p2-p1;  len = norm(vec);
+    if len < 1e-6, Xc=zeros(2,5); Yc=Xc; Zc=Xc; return; end
+    ax_l = vec/len;
+    ax_w = cross([0 0 1], ax_l);
+    if norm(ax_w)<1e-6, ax_w=[1 0 0]; else, ax_w=ax_w/norm(ax_w); end
+    ax_t = cross(ax_l, ax_w); ax_t=ax_t/norm(ax_t);
+    cs = [hw,ht; hw,-ht; -hw,-ht; -hw,ht; hw,ht];
+    Xc=zeros(2,5); Yc=Xc; Zc=Xc;
+    for ii = 1:2
+        pt = ternval(ii==1, p1, p2);
+        for jj = 1:5
+            off = cs(jj,1)*ax_w + cs(jj,2)*ax_t;
+            Xc(ii,jj)=pt(1)+off(1); Yc(ii,jj)=pt(2)+off(2); Zc(ii,jj)=pt(3)+off(3);
+        end
+    end
+end
+
+function [Xc,Yc,Zc] = arm_cap_arc(p1, p2, side, hw, ht, n_cap)
+    vec = p2-p1;  len = norm(vec);
+    if len < 1e-6, Xc=zeros(n_cap,5); Yc=Xc; Zc=Xc; return; end
+    ax_l = vec/len;
+    ax_w = cross([0 0 1], ax_l);
+    if norm(ax_w)<1e-6, ax_w=[1 0 0]; else, ax_w=ax_w/norm(ax_w); end
+    ax_t = cross(ax_l, ax_w); ax_t=ax_t/norm(ax_t);
+    if side < 0, ctr=p1; dir=-ax_l; else, ctr=p2; dir=ax_l; end
+    cs = [hw,ht; hw,-ht; -hw,-ht; -hw,ht; hw,ht];
+    phi_v = linspace(-pi/2, pi/2, n_cap);
+    Xc=zeros(n_cap,5); Yc=Xc; Zc=Xc;
+    for ii = 1:n_cap
+        phi = phi_v(ii);
+        pt  = ctr + dir*(hw*sin(phi));
+        for jj = 1:5
+            off = cs(jj,1)*cos(phi)*ax_w + cs(jj,2)*ax_t;
+            Xc(ii,jj)=pt(1)+off(1); Yc(ii,jj)=pt(2)+off(2); Zc(ii,jj)=pt(3)+off(3);
+        end
+    end
+end
+
+function r = ternval(cond, tv, fv)
+    if cond, r=tv; else, r=fv; end
+end
