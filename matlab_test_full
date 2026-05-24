@@ -1,0 +1,1052 @@
+function Robot3RRR_DayDu_Realistic(traj_choice, v_des, varargin)
+% Robot3RRR_DayDu_Realistic - Mo phong Robot 3-RRR phang voi dong luc hoc bac 2 chinh xac
+% Goi: Robot3RRR_DayDu_Realistic(1, 5.0, 35, 30)  -> duong thang den (35,30)
+%      Robot3RRR_DayDu_Realistic(4, 5.0, 8)        -> duong tron R=8cm
+clc; close all;
+rng(42);
+
+%% ====================================================================
+%  HINH HOC
+% =====================================================================
+H  = 50;    % cm, canh tam giac co dinh
+l  = 20;    % cm, chieu dai moi khau
+
+platform_side = H / 10;
+r_plat        = platform_side / sqrt(3);  % cm, ban kinh platform
+m_plat_cm     = r_plat;                   % chi dung cho ban do ky di (don vi cm)
+
+Lm = l / 100;   % m
+rm = r_plat / 100;  % m, ban kinh platform
+
+A1 = [0, 0];
+A2 = [H, 0];
+A3 = [H/2, (sqrt(3)/2)*H];
+A  = [A1; A2; A3];   % cm
+Am = A / 100;         % m
+
+% Goc dinh huong cac diem noi platform (radian)
+OFFSET_plat = [210; 330; 90] * pi/180;
+
+% Offset calibration (tu RRResp.ino)
+offset_deg = [-19.49; 100.51; -139.49];
+offset_rad = offset_deg * pi / 180;
+
+%% ====================================================================
+%  THONG SO VAT LY
+% =====================================================================
+KL      = 100;      % g, khoi luong platform
+m_seg   = 100;      % g, khoi luong moi khau
+w_arm   = 4;        % cm, chieu rong khau (do hoa 3D)
+t_arm   = 0.5;      % cm, chieu day khau
+tau_max = 0.6;      % N.m, moment cuc dai
+CPR     = 8192;     % xung/vong encoder
+
+% --- Motor GA32Y-31ZY-1280 | 71:1 | 12V | 112RPM ---
+V_supply     = 12;
+I_stall      = 5.0;
+ratio_gear   = 71;
+R_motor      = V_supply / I_stall;                        % 2.4 ohm
+omega_noload_rpm = 112 * ratio_gear;
+omega_no_load    = omega_noload_rpm * 2*pi / 60;          % rad/s motor shaft
+I_noload         = 0.45;
+Ke_motor = (V_supply - I_noload*R_motor) / omega_no_load; % V.s/rad
+eta_gear     = 0.75;
+T_stall_out  = 33 * 0.0981;                               % N.m
+T_stall_mot  = T_stall_out / (ratio_gear * eta_gear);
+Kt_motor     = T_stall_mot / I_stall;                     % N.m/A
+J_motor_total = 1.95e-6;                                  % kg.m^2
+tau_noload_mot = Ke_motor * I_noload;
+b_motor        = tau_noload_mot / omega_no_load;
+L_motor        = 0.002 * R_motor;
+motor_efficiency = (10*0.0981 * 90*2*pi/60) / (V_supply * 1.8);  % ~0.428
+tau_stall_motor  = Kt_motor * I_stall;
+motor_tau        = J_motor_total * R_motor / (Kt_motor * Ke_motor);
+
+% --- Khoi luong & quan tinh khau ---
+m_link_kg = m_seg / 1000;         % 0.1 kg
+m_plat_kg = KL  / 1000;           % 0.1 kg
+Lc        = Lm / 2;               % vi tri tam khoi luong
+I1_joint  = (1/3)*m_link_kg*Lm^2; % quan tinh khau proximal quay quanh khop (kg.m^2)
+I2_joint  = (1/3)*m_link_kg*Lm^2; % quan tinh khau distal quay quanh dau khau 1
+
+tau_friction  = 0.005;
+B_viscous     = b_motor;
+sigma_encoder = 1 * (2*pi / CPR);
+rpm_max_adj   = 112 * sqrt(100/KL);
+
+%% ====================================================================
+%  DONG LUC HOC BAC 2 CHINH XAC - Robot 3-RRR song song phang
+% =====================================================================
+%
+%  Phuong trinh: M(q)*ddq + C(q,dq)*dq = tau - tau_fric
+%
+%  q = [q1; q2; q3] - goc cac khop chu dong (rad, goc hinh hoc)
+%
+%  Cau truc M(q) DUNG (co tinh coupling qua platform):
+%
+%    M(q) = M_arm(q) + J_x(q)^T * M_plat * J_x(q)
+%
+%  Trong do:
+%    M_arm(q) = ma tran quan tinh cac khau (3x3)
+%    J_x(q)   = Jacobian tu khong gian khop -> van toc diem trung tam platform (3x3)
+%    M_plat   = [m_plat 0 0; 0 m_plat 0; 0 0 Ip] (khoi luong/quan tinh platform)
+%
+%  M_arm: phan tu thu i,i
+%    M_arm_ii(q_i) = I1_joint                       % khau proximal quay quanh Ai
+%                  + I2_joint + m_link_kg*Lm^2      % khau distal quay quanh dau khau 1
+%                                                   % (trong rang buoc RR: q2i ~ q1i)
+%                  + J_motor_total                  % motor
+%
+%  Luu y: Vi rang buoc song song, moi khop i chi co 1 DOF that su.
+%  Khau distal bi rang buoc (closed-loop). Do do dung mo hinh 1-DOF moi chuoi.
+%
+%  J_x(q): Jacobian vi phan (xP, yP, phi) theo (q1, q2, q3)
+%    Tinh tu IK nguoc: moi hang i tuong ung khop i
+%    dxP/dqi = dxPi/dqi (tu dieu kien rang buoc)
+%
+%  CACH TINH J_x DON GIAN VA CHUAN:
+%    Diem Bi (dau khau distal noi voi platform) thoa:
+%      Bi_x = Ai_x + Lm*cos(qi) + Lm*cos(qi + psi_i)
+%    Trong robot song song 3-RRR, psi_i (goc khau 2) phu thuoc qi va (xP,yP).
+%    Dao ham an thu:
+%      dBi/dqi = [dBi_x/dqi; dBi_y/dqi]
+%    Tinh xap xi bang phuong phap sai phan huu han (chinh xac den may tinh).
+%    Sau do:  J_x(q) = [dBi/dqi] (3x2) roi lay gia tri trung binh cho (xP,yP).
+%
+%  Vi robot song song: J_x la Jacobian tu goc khop sang van toc platform (xP dot, yP dot)
+%    [xPdot; yPdot; phi_dot] = J_x(q) * dq
+%  =>  J_x(q) duoc tinh tu giai phuong trinh:
+%      A_mat * [xPdot; yPdot] = B_mat * dq   (A: 3x2, B: 3x3)
+%      J_x = A_mat \ B_mat  khi A_mat invertible (goc phi=0 => 3x2 chieu sang 3x3)
+%
+%  Thuc te cho phi=0 (platform khong quay), J_x la ma tran 2x3:
+%    row i: [-l*sin(qi), l*cos(qi)] / det_denominatori
+%  Ma tran day du 3x3 (them hang phi):
+%    J_x_full = pinv(A_mat) * B_mat
+%
+%  De giu code ngan gon va dam bao tinh toan duoc trong vong lap,
+%  M(q) duoc tinh TRUC TIEP moi buoc tu q_geo hien tai.
+% =====================================================================
+
+% ---------------------------------------------------------------
+% Ham noi bo: chi tinh M(q) - KHONG de quy, dung cho Christoffel
+% ---------------------------------------------------------------
+    function Mq = calc_M_only(q)
+        % Phan quan tinh cac khau (duong cheo, 1-DOF moi chuoi)
+        M_arm = diag(repmat(I1_joint + I2_joint + m_link_kg*Lm^2 + J_motor_total, 3, 1));
+
+        % Jacobian giai tich: J_x(i,:) = [dxP/dqi, dyP/dqi]
+        % Tinh tu FK xap xi (2 khau thang hang): Bi ~ Ai + 2*Lm*[cos(qi);sin(qi)]
+        % => xP ~ Bi_x - rm*cos(OFFSET_i)
+        % => dxP/dqi = -2*Lm*sin(qi),  dyP/dqi = 2*Lm*cos(qi)
+        % Day la dao ham giai tich chinh xac cua xap xi FK dung o day.
+        J_x = zeros(3,2);
+        for ii = 1:3
+            J_x(ii,1) = -2*Lm*sin(q(ii));
+            J_x(ii,2) =  2*Lm*cos(q(ii));
+        end
+
+        % Dong gop platform: J_x^T * m_plat * J_x (3x3)
+        % Dung dang chinh xac: M_plat = J_x * m_plat * J_x'
+        % (J_x la 3x2, J_x*J_x' la 3x3 -> dung)
+        M_plat = m_plat_kg * (J_x * J_x');
+
+        Mq = M_arm + M_plat;
+
+        % Bao dam doi xung va duong xac dinh
+        Mq = (Mq + Mq') / 2;
+        min_eig = min(eig(Mq));
+        if min_eig < 1e-8
+            Mq = Mq + (1e-8 - min_eig)*eye(3);
+        end
+    end
+
+% ---------------------------------------------------------------
+% Ham chinh: tinh [M(q), C(q,dq)] - goi calc_M_only (khong de quy)
+% ---------------------------------------------------------------
+    function [Mq, Cq] = calc_dynamics(q, dq, ~, ~)
+        % M(q)
+        Mq = calc_M_only(q);
+
+        % C(q,dq) tu Christoffel symbols bang sai phan huu han cua M
+        % Gamma_ijk = 0.5*(dM_ij/dq_k + dM_ik/dq_j - dM_jk/dq_i)
+        % C_ij = sum_k Gamma_ijk * dq_k
+        eps_c = 1e-5;
+        dM = zeros(3,3,3);
+        for kk = 1:3
+            q_pk = q; q_pk(kk) = q_pk(kk) + eps_c;
+            q_mk = q; q_mk(kk) = q_mk(kk) - eps_c;
+            dM(:,:,kk) = (calc_M_only(q_pk) - calc_M_only(q_mk)) / (2*eps_c);
+        end
+        Cq = zeros(3,3);
+        for ii = 1:3
+            for jj = 1:3
+                cij = 0;
+                for kk = 1:3
+                    Gamma = 0.5*(dM(ii,jj,kk) + dM(ii,kk,jj) - dM(jj,kk,ii));
+                    cij = cij + Gamma * dq(kk);
+                end
+                Cq(ii,jj) = cij;
+            end
+        end
+    end
+
+% Ham tinh G = 0 (nam ngang)
+calc_G = @(q) zeros(3,1);
+
+fprintf('=== DONG LUC HOC BAC 2 CHINH XAC (3-RRR song song, nam ngang) ===\n');
+fprintf('m_link=%.4f kg | m_plat=%.4f kg | Lm=%.4f m | Lc=%.4f m\n', m_link_kg, m_plat_kg, Lm, Lc);
+fprintf('I1_joint=%.6e | I2_joint=%.6e | J_motor=%.6e kg.m^2\n', I1_joint, I2_joint, J_motor_total);
+fprintf('M(q): M_arm (diagonal, 1-DOF/chain) + J_x^T*m_plat*J_x (coupling)\n');
+fprintf('C(q,dq): Christoffel symbols tu sai phan huu han cua M\n');
+fprintf('G(q) = 0 (robot nam ngang)\n');
+fprintf('Motor: R=%.2f ohm | Kt=%.4f N.m/A | Ke=%.4f V.s/rad | tau_stall=%.3f N.m\n', ...
+    R_motor, Kt_motor, Ke_motor, tau_stall_motor);
+
+%% ====================================================================
+%  BO DIEU KHIEN
+% =====================================================================
+PWM_MAX            = 100;
+PWM_RESOLUTION_MAX = 255;
+
+kp_pid = 3.5;
+ki_pid = 0.2;
+kd_pid = 0.035;
+
+scale        = CPR / (2*pi);
+sim_ctrl_dt  = 0.002;
+deriv_filter = 0.18;
+Imax_pid     = 120;
+PWM_DEADBAND = 6;
+
+alpha  = 15;
+beta   = 10;
+Kp_ctc = (alpha^2 + beta^2) * eye(3);
+Kd_ctc = 2 * alpha * eye(3);
+Ki_ctc = 5 * eye(3);
+
+fprintf('\n=== BO DIEU KHIEN ===\n');
+fprintf('PID: Kp=%.3f | Ki=%.3f | Kd=%.3f (PWM/xung)\n', kp_pid, ki_pid, kd_pid);
+fprintf('CTC: alpha=%d | Kp=%.0f | Kd=%.0f | Ki=%.0f\n', alpha, Kp_ctc(1,1), Kd_ctc(1,1), Ki_ctc(1,1));
+
+%% ====================================================================
+%  QUY DAO
+% =====================================================================
+fprintf('\n1=Duong thang  2=Tam giac  3=Hinh vuong  4=Duong tron\n');
+if nargin < 1 || isempty(traj_choice)
+    traj_choice = input('Chon quy dao (1-4): ');
+end
+if nargin < 2 || isempty(v_des)
+    v_des = input('Van toc (cm/s): ');
+end
+
+x0_cm = H/2;
+y0_cm = (sqrt(3)/4)*H;
+n     = 200;
+
+switch traj_choice
+    case 1
+        if numel(varargin) >= 2
+            xt = varargin{1}; yt = varargin{2};
+        else
+            xt = input('X dich (cm): '); yt = input('Y dich (cm): ');
+        end
+        dist   = sqrt((xt-x0_cm)^2 + (yt-y0_cm)^2);
+        T_sim  = dist / v_des;
+        x_traj = linspace(x0_cm, xt, n);
+        y_traj = linspace(y0_cm, yt, n);
+    case 2
+        if numel(varargin) >= 1, sl = varargin{1};
+        else, sl = input('Canh tam giac (cm): '); end
+        ang = [90, 210, 330]*pi/180; r_tri = sl/sqrt(3); nps = floor(n/3);
+        x_traj = []; y_traj = [];
+        for i = 1:3
+            ni = mod(i,3)+1;
+            x_traj = [x_traj, linspace(x0_cm+r_tri*cos(ang(i)), x0_cm+r_tri*cos(ang(ni)), nps)]; %#ok
+            y_traj = [y_traj, linspace(y0_cm+r_tri*sin(ang(i)), y0_cm+r_tri*sin(ang(ni)), nps)]; %#ok
+        end
+        n = length(x_traj); dist = 3*sl; T_sim = dist/v_des;
+    case 3
+        if numel(varargin) >= 1, sl = varargin{1};
+        else, sl = input('Canh hinh vuong (cm): '); end
+        hs = sl/2;
+        corn = [x0_cm-hs,y0_cm-hs; x0_cm+hs,y0_cm-hs; x0_cm+hs,y0_cm+hs; x0_cm-hs,y0_cm+hs];
+        nps = floor(n/4); x_traj = []; y_traj = [];
+        for i = 1:4
+            ni = mod(i,4)+1;
+            x_traj = [x_traj, linspace(corn(i,1),corn(ni,1),nps)]; %#ok
+            y_traj = [y_traj, linspace(corn(i,2),corn(ni,2),nps)]; %#ok
+        end
+        n = length(x_traj); dist = 4*sl; T_sim = dist/v_des;
+    case 4
+        if numel(varargin) >= 1, rc = varargin{1};
+        else, rc = input('Ban kinh (cm): '); end
+        thc = linspace(0,2*pi,n);
+        x_traj = x0_cm + rc*cos(thc); y_traj = y0_cm + rc*sin(thc);
+        dist = 2*pi*rc; T_sim = dist/v_des;
+    otherwise
+        error('Lua chon khong hop le');
+end
+
+phi_traj   = zeros(1, n);
+T_vec      = linspace(0, T_sim, n);
+dt         = T_sim / (n-1);
+traj_names = {'Duong thang','Tam giac','Hinh vuong','Duong tron'};
+fprintf('Quy dao: %s | L=%.2f cm | T=%.2f s\n', traj_names{traj_choice}, dist, T_sim);
+
+%% ====================================================================
+%  DONG HOC NGUOC (IK) - CO XU LY TINH LIEN TUC VA ELBOW
+% =====================================================================
+%
+%  IK chinh xac cho robot 3-RRR phang:
+%    Moi chuoi i (khop chu dong + khau distal):
+%      Ai -> Ei (khop thi) -> Bi (diem noi platform)
+%    Bi da biet tu vi tri platform: Bi = P + rm*[cos(OFFSET_i); sin(OFFSET_i)]
+%    Dieu kien: |Ai-Bi| <= 2*Lm
+%    Giai:
+%      d_i = |Bi - Ai|
+%      alpha_i = atan2(Bi_y - Ai_y, Bi_x - Ai_x)
+%      beta_i  = acos(d_i / (2*Lm))
+%      qi = alpha_i - beta_i  (elbow-up: +beta; elbow-down: -beta)
+%
+%  Chon elbow: lua chon dau bat dau (uu tien elbow-down)
+%  Tinh lien tuc: khi co nhieu nghiem, chon nghiem gan q truoc nhat
+%    de tranh nhay goc dot ngot
+% =====================================================================
+
+x_m = x_traj / 100;
+y_m = y_traj / 100;
+
+q_geo  = zeros(n, 3);  % goc hinh hoc (rad)
+q_d    = zeros(n, 3);  % goc encoder (rad) = q_geo - offset_rad
+ik_ok  = true(n, 1);   % flag IK thanh cong
+
+for k = 1:n
+    xP = x_m(k);
+    yP = y_m(k);
+    for i = 1:3
+        % Diem noi platform chuoi thu i (m)
+        Bi_x = xP + rm * cos(OFFSET_plat(i));
+        Bi_y = yP + rm * sin(OFFSET_plat(i));
+        dx   = Bi_x - Am(i,1);
+        dy   = Bi_y - Am(i,2);
+        d    = sqrt(dx^2 + dy^2);
+
+        if d > 2*Lm - 1e-6 || d < 1e-4
+            % Ngoai workspace
+            ik_ok(k) = false;
+            if k > 1
+                q_geo(k,i) = q_geo(k-1,i); % giu gia tri cu
+            end
+        else
+            alpha_ik = atan2(dy, dx);
+            beta_ik  = acos(min(max(d/(2*Lm), -1), 1));
+
+            % Hai nghiem elbow
+            q_sol1 = alpha_ik - beta_ik;  % elbow-down
+            q_sol2 = alpha_ik + beta_ik;  % elbow-up
+
+            if k == 1
+                % Buoc dau: chon elbow-down
+                q_geo(k,i) = q_sol1;
+            else
+                % Buoc tiep theo: chon nghiem gan q truoc nhat (tinh lien tuc)
+                diff1 = angdiff(q_sol1, q_geo(k-1,i));
+                diff2 = angdiff(q_sol2, q_geo(k-1,i));
+                if abs(diff1) <= abs(diff2)
+                    q_geo(k,i) = q_sol1;
+                else
+                    q_geo(k,i) = q_sol2;
+                end
+            end
+        end
+
+        % Chuyen sang goc encoder
+        q_d(k,i) = q_geo(k,i) - offset_rad(i);
+    end
+end
+
+% Lam min goc tranh nhay (unwrap)
+for i = 1:3
+    q_geo(:,i) = unwrap(q_geo(:,i));
+    q_d(:,i)   = unwrap(q_d(:,i));
+end
+
+% Dao ham bang gradient bac cao hon
+dq_d  = zeros(n, 3);
+ddq_d = zeros(n, 3);
+for i = 1:3
+    % Gradient bac 2 trung tam cho noi, bac 1 cho bien
+    dq_d(:,i)  = gradient(q_geo(:,i), dt);  % dung q_geo cho tinh toan dong luc hoc
+    ddq_d(:,i) = gradient(dq_d(:,i),  dt);
+end
+
+%% ====================================================================
+%  BAN DO KY DI
+% =====================================================================
+fprintf('Dang tinh ban do ky di...\n');
+[X_grid, Y_grid] = meshgrid(linspace(-5, H+5, 120), linspace(-5, H+5, 120));
+det_map  = nan(size(X_grid));
+sing_thr = 1e-3;
+cond_thr = 100;
+
+for ii = 1:size(X_grid,1)
+    for jj = 1:size(X_grid,2)
+        xP = X_grid(ii,jj); yP = Y_grid(ii,jj);
+        Pg = [xP + m_plat_cm*cos(210*pi/180), yP + m_plat_cm*sin(210*pi/180);
+              xP + m_plat_cm*cos(330*pi/180), yP + m_plat_cm*sin(330*pi/180);
+              xP + m_plat_cm*cos( 90*pi/180), yP + m_plat_cm*sin( 90*pi/180)];
+        Jg  = zeros(3,3); vld = true;
+        for k = 1:3
+            dx = Pg(k,1)-A(k,1); dy = Pg(k,2)-A(k,2);
+            d  = sqrt(dx^2+dy^2);
+            if d > 2*l || d < 0.01, vld = false; break; end
+            th = atan2(dy,dx) - acos(min(max(d/(2*l),-1),1));
+            Jg(k,1) = -l*sin(th);
+            Jg(k,2) =  l*cos(th);
+            Jg(k,3) = -l*sin(th)*(Pg(k,2)-yP) + l*cos(th)*(Pg(k,1)-xP);
+        end
+        if vld, det_map(ii,jj) = abs(det(Jg)); end
+    end
+end
+fprintf('Ban do ky di: hoan tat\n');
+
+% Precompute sin/cos tren q_geo
+sin_pre = sin(q_geo);
+cos_pre = cos(q_geo);
+
+%% ====================================================================
+%  FIGURE 1: MO PHONG REALTIME
+% =====================================================================
+ui_bg = [0.96 0.975 0.99];
+ax_bg = [0.995 0.997 1.00];
+fig1  = figure('Name','Robot 3-RRR | Mo Phong', ...
+    'NumberTitle','off','Color',ui_bg, ...
+    'Units','normalized','OuterPosition',[0 0 1 1]);
+
+ax_2d   = axes('Position',[0.025 0.58 0.155 0.34]);
+ax_info = axes('Position',[0.025 0.08 0.155 0.42]);
+ax_3d   = axes('Position',[0.205 0.36 0.335 0.56]);
+ax_sin  = axes('Position',[0.205 0.08 0.155 0.23]);
+ax_cos  = axes('Position',[0.385 0.08 0.155 0.23]);
+
+pos_r = [0.585 0.57 0.185 0.32;
+         0.795 0.57 0.185 0.32;
+         0.585 0.12 0.185 0.32;
+         0.795 0.12 0.185 0.32];
+ax_r = gobjects(4,1);
+for sp = 1:4
+    ax_r(sp) = axes('Position', pos_r(sp,:)); %#ok
+end
+set([ax_2d ax_info ax_3d ax_sin ax_cos ax_r'], 'Color', ax_bg);
+set([ax_2d ax_3d ax_sin ax_cos ax_r'], 'LineWidth',0.9,'FontName','Arial','FontSize',8);
+
+% --- Panel 2D (ban do ky di + quy dao) ---
+axes(ax_2d); hold on; axis equal; grid on;
+axis([-10 H+10 -10 H+10]);
+xlabel('X (cm)'); ylabel('Y (cm)');
+title('Det Jacobian (log10)','FontSize',10,'FontWeight','bold');
+contourf(ax_2d, X_grid, Y_grid, log10(det_map+1e-10), 20,'LineColor','none');
+colorbar(ax_2d); colormap(ax_2d, jet); clim(ax_2d,[-3 1]);
+contour(ax_2d, X_grid, Y_grid, det_map,[sing_thr sing_thr],'r-','LineWidth',2);
+plot(ax_2d,[A1(1) A2(1) A3(1) A1(1)],[A1(2) A2(2) A3(2) A1(2)],'k-','LineWidth',2.5);
+text(ax_2d,A1(1)-3,A1(2)-3,'A1','FontSize',9,'FontWeight','bold');
+text(ax_2d,A2(1)+1,A2(2)-3,'A2','FontSize',9,'FontWeight','bold');
+text(ax_2d,A3(1),A3(2)+2,'A3','FontSize',9,'FontWeight','bold');
+plot(ax_2d,x_traj,y_traj,'w-','LineWidth',2);
+plot(ax_2d,x_traj(1),y_traj(1),'go','MarkerSize',9,'MarkerFaceColor','g');
+plot(ax_2d,x_traj(end),y_traj(end),'r*','MarkerSize',12,'LineWidth',2);
+pt_G2d    = plot(ax_2d,nan,nan,'wo','MarkerFaceColor','w','MarkerSize',7,'LineWidth',1.5);
+pt_plat2d = fill(ax_2d,nan,nan,'c','FaceAlpha',0.5,'EdgeColor','w','LineWidth',1.5);
+h_link2d  = gobjects(3,1);
+for i = 1:3
+    h_link2d(i) = plot(ax_2d,nan,nan,'y-','LineWidth',2.5);
+end
+
+% --- Panel 3D ---
+axes(ax_3d); hold on; axis equal; grid on;
+xlabel('X (cm)','FontSize',11); ylabel('Y (cm)','FontSize',11); zlabel('Z (cm)','FontSize',11);
+title('Mo Phong 3D Robot','FontSize',13,'FontWeight','bold');
+view(45,35); lighting gouraud; camlight('right'); camlight('left');
+set(ax_3d,'Color','white','GridColor',[0.75 0.75 0.75],'GridAlpha',0.5,'Box','on');
+axis(ax_3d,[-10 H+10 -10 H+10 -8 8]);
+
+[bx,by] = meshgrid(linspace(-5,H+5,2),linspace(-5,H+5,2));
+surf(ax_3d,bx,by,zeros(2)-2,'FaceColor',[0.90 0.90 0.92],'EdgeColor','none','FaceAlpha',0.6);
+fill3(ax_3d,[A1(1) A2(1) A3(1) A1(1)],[A1(2) A2(2) A3(2) A1(2)],zeros(1,4)-1.5,...
+    [0.75 0.75 0.78],'FaceAlpha',0.85,'EdgeColor',[0.2 0.2 0.2],'LineWidth',2);
+
+hw = w_arm/2; ht = t_arm/2; n_cap = 14; jr = hw*0.7;
+arm_col = [0.92 0.28 0.10; 0.10 0.72 0.28; 0.15 0.45 0.92];
+[sx,sy,sz] = sphere(16);
+
+h3d_links = gobjects(3,2); h3d_caps1 = gobjects(3,2);
+h3d_caps2 = gobjects(3,2); h3d_joints = gobjects(3,2);
+h3d_plat  = patch(ax_3d,'XData',[],'YData',[],'ZData',[],...
+    'FaceColor',[0.0 0.65 0.85],'FaceAlpha',0.88,'EdgeColor',[0.0 0.3 0.6],'LineWidth',2);
+h3d_ctr   = plot3(ax_3d,nan,nan,nan,'o',...
+    'MarkerFaceColor',[0.0 0.3 0.6],'MarkerEdgeColor','w','MarkerSize',9,'LineWidth',2);
+
+for i = 1:3
+    col = arm_col(i,:); cold = col*0.72;
+    [cx_t,cy_t,cz_t] = arm_body_surf([0 0 0],[1 0 0],hw,ht);
+    h3d_links(i,1) = surf(ax_3d,cx_t,cy_t,cz_t,'FaceColor',col,'EdgeColor','none','FaceAlpha',1,'SpecularStrength',0.5);
+    h3d_links(i,2) = surf(ax_3d,cx_t,cy_t,cz_t,'FaceColor',cold,'EdgeColor','none','FaceAlpha',1,'SpecularStrength',0.5);
+    [cx_t,cy_t,cz_t] = arm_cap_arc([0 0 0],[1 0 0],-1,hw,ht,n_cap);
+    h3d_caps1(i,1) = surf(ax_3d,cx_t,cy_t,cz_t,'FaceColor',col,'EdgeColor','none','FaceAlpha',1);
+    h3d_caps1(i,2) = surf(ax_3d,cx_t,cy_t,cz_t,'FaceColor',cold,'EdgeColor','none','FaceAlpha',1);
+    [cx_t,cy_t,cz_t] = arm_cap_arc([0 0 0],[1 0 0],+1,hw,ht,n_cap);
+    h3d_caps2(i,1) = surf(ax_3d,cx_t,cy_t,cz_t,'FaceColor',col,'EdgeColor','none','FaceAlpha',1);
+    h3d_caps2(i,2) = surf(ax_3d,cx_t,cy_t,cz_t,'FaceColor',cold,'EdgeColor','none','FaceAlpha',1);
+    h3d_joints(i,1) = surf(ax_3d,sx*jr,sy*jr,sz*jr,'FaceColor',[0.88 0.88 0.90],'EdgeColor','none','FaceAlpha',1,'SpecularStrength',0.8);
+    h3d_joints(i,2) = surf(ax_3d,sx*jr,sy*jr,sz*jr,'FaceColor',[0.78 0.78 0.80],'EdgeColor','none','FaceAlpha',1,'SpecularStrength',0.8);
+    surf(ax_3d,sx*jr*1.3+A(i,1),sy*jr*1.3+A(i,2),sz*jr*1.3,'FaceColor',col,'EdgeColor','none','FaceAlpha',1,'SpecularStrength',0.6);
+end
+
+% --- Panel sin/cos ---
+anim_col = [0.85 0.10 0.10; 0.10 0.65 0.20; 0.10 0.35 0.85];
+hold(ax_sin,'on'); grid(ax_sin,'on'); box(ax_sin,'on');
+title(ax_sin,'sin(theta) cac khop','FontSize',10,'FontWeight','bold');
+xlabel(ax_sin,'Thoi gian (s)','FontSize',9); ylabel(ax_sin,'sin(theta)','FontSize',9);
+axis(ax_sin,[0 T_sim -1.15 1.15]);
+for i = 1:3
+    plot(ax_sin,T_vec,sin_pre(:,i),'-','Color',anim_col(i,:)*0.35+0.65,'LineWidth',0.9,'DisplayName',sprintf('Khop %d',i));
+end
+legend(ax_sin,'Location','best','FontSize',7,'Box','off');
+h_sin_pt = gobjects(3,1);
+for i = 1:3
+    h_sin_pt(i) = plot(ax_sin,T_vec(1),sin_pre(1,i),'o','MarkerFaceColor',anim_col(i,:),'MarkerEdgeColor','w','MarkerSize',7,'HandleVisibility','off');
+end
+
+hold(ax_cos,'on'); grid(ax_cos,'on'); box(ax_cos,'on');
+title(ax_cos,'cos(theta) cac khop','FontSize',10,'FontWeight','bold');
+xlabel(ax_cos,'Thoi gian (s)','FontSize',9); ylabel(ax_cos,'cos(theta)','FontSize',9);
+axis(ax_cos,[0 T_sim -1.15 1.15]);
+for i = 1:3
+    plot(ax_cos,T_vec,cos_pre(:,i),'--','Color',anim_col(i,:)*0.35+0.65,'LineWidth',0.9,'DisplayName',sprintf('Khop %d',i));
+end
+legend(ax_cos,'Location','best','FontSize',7,'Box','off');
+h_cos_pt = gobjects(3,1);
+for i = 1:3
+    h_cos_pt(i) = plot(ax_cos,T_vec(1),cos_pre(1,i),'s','MarkerFaceColor',anim_col(i,:),'MarkerEdgeColor','w','MarkerSize',7,'HandleVisibility','off');
+end
+
+% --- 4 panel phai ---
+panel_titles = {'Moment dieu khien (mN.m)','PWM PID: lenh va motor','Sai so goc - CTC (deg)','Sai so goc - PID (deg)'};
+panel_ylabs  = {'tau (mN.m)','PWM','e (deg)','e (deg)'};
+ln_r = gobjects(4,3); pt_r = gobjects(4,3);
+ln_tau_pid = gobjects(3,1); pt_tau_pid = gobjects(3,1);
+ln_pwm_cmd = gobjects(3,1); pt_pwm_cmd = gobjects(3,1);
+
+for sp = 1:4
+    hold(ax_r(sp),'on'); grid(ax_r(sp),'on'); box(ax_r(sp),'on');
+    title(ax_r(sp),panel_titles{sp},'FontSize',9,'FontWeight','bold');
+    xlabel(ax_r(sp),'Thoi gian (s)','FontSize',8);
+    ylabel(ax_r(sp),panel_ylabs{sp},'FontSize',8);
+    set(ax_r(sp),'FontSize',8);
+    for i = 1:3
+        ln_r(sp,i) = plot(ax_r(sp),nan,nan,'-','Color',anim_col(i,:),'LineWidth',1.5,'DisplayName',sprintf('Khop %d',i));
+    end
+    if sp==1
+        yline(ax_r(sp), tau_max*1000,'r--','LineWidth',1.2,'HandleVisibility','off');
+        yline(ax_r(sp),-tau_max*1000,'r--','LineWidth',1.2,'HandleVisibility','off');
+    elseif sp==2
+        yline(ax_r(sp), PWM_MAX,'r--','LineWidth',1.2,'HandleVisibility','off');
+        yline(ax_r(sp),-PWM_MAX,'r--','LineWidth',1.2,'HandleVisibility','off');
+    else
+        yline(ax_r(sp),0,'k--','LineWidth',0.8,'HandleVisibility','off');
+    end
+    legend(ax_r(sp),'Location','best','FontSize',7,'Box','off');
+    for i = 1:3
+        pt_r(sp,i) = plot(ax_r(sp),nan,nan,'o','MarkerFaceColor',anim_col(i,:),'MarkerEdgeColor','w','MarkerSize',6,'HandleVisibility','off');
+    end
+end
+for i = 1:3
+    ln_r(1,i).DisplayName = sprintf('CTC %d',i);
+    ln_r(2,i).DisplayName = sprintf('Motor %d',i);
+    soft_col = anim_col(i,:)*0.55 + [0.45 0.45 0.45]*0.45;
+    ln_tau_pid(i) = plot(ax_r(1),nan,nan,'--','Color',soft_col,'LineWidth',1.15,'DisplayName',sprintf('PIDeq %d',i));
+    pt_tau_pid(i) = plot(ax_r(1),nan,nan,'s','MarkerFaceColor',soft_col,'MarkerEdgeColor','w','MarkerSize',5,'HandleVisibility','off');
+    ln_pwm_cmd(i) = plot(ax_r(2),nan,nan,':','Color',soft_col,'LineWidth',1.05,'DisplayName',sprintf('Lenh %d',i));
+    pt_pwm_cmd(i) = plot(ax_r(2),nan,nan,'s','MarkerFaceColor',soft_col,'MarkerEdgeColor','w','MarkerSize',5,'HandleVisibility','off');
+end
+ylim(ax_r(1),[-80 80]); ylim(ax_r(2),[-PWM_MAX PWM_MAX]);
+legend(ax_r(1),'Location','best','FontSize',6.5,'Box','off');
+legend(ax_r(2),'Location','best','FontSize',6.5,'Box','off');
+
+sgtitle(fig1, sprintf('Robot 3-RRR | Quy dao: %s | v=%.1f cm/s | T=%.2f s', ...
+    traj_names{traj_choice}, v_des, T_sim),'FontSize',12,'FontWeight','bold');
+axis(ax_info,'off');
+
+%% ====================================================================
+%  KHOI TAO TRANG THAI
+% =====================================================================
+q_pid  = q_geo(1,:)';   % dung q_geo cho dong luc hoc
+dq_pid = zeros(3,1);
+q_ctc  = q_geo(1,:)';
+dq_ctc = zeros(3,1);
+
+I_err_pid       = zeros(3,1);
+I_err_ctc       = zeros(3,1);
+e_prev_pid      = zeros(3,1);
+de_pid_filt     = zeros(3,1);
+u_pid_cmd_state = zeros(3,1);
+u_pid_motor_state = zeros(3,1);
+motor_current_pid = zeros(3,1);
+tau_pid_state   = zeros(3,1);
+tau_ctc_state   = zeros(3,1);
+
+q_pid_log       = zeros(n,3);
+q_ctc_log       = zeros(n,3);
+tau_ctc_log     = zeros(n,3);
+tau_pid_eq_log  = zeros(n,3);
+pwm_pid_log     = zeros(n,3);
+pwm_pid_cmd_log = zeros(n,3);
+e_pid_log       = zeros(n,3);
+e_ctc_log       = zeros(n,3);
+
+theta_all        = zeros(n,3);
+det_J_all        = zeros(n,1);
+cond_J_all       = zeros(n,1);
+singularity_flag = zeros(n,1);
+near_sing_flag   = zeros(n,1);
+v_mag            = zeros(n,1);
+rpm_all          = zeros(n,3);
+rpm_over_flag    = zeros(n,3);
+
+q_pid_log(1,:) = q_pid';
+q_ctc_log(1,:) = q_ctc';
+
+%% ====================================================================
+%  VONG LAP MO PHONG CHINH
+% =====================================================================
+fprintf('\n=== BAT DAU MO PHONG ===\n');
+
+for k = 1:n
+    xP  = x_traj(k);
+    yP  = y_traj(k);
+    phi = phi_traj(k);
+    t_k = (k-1)*dt;
+
+    P1 = [xP + m_plat_cm*cos(phi + 210*pi/180), yP + m_plat_cm*sin(phi + 210*pi/180)];
+    P2 = [xP + m_plat_cm*cos(phi + 330*pi/180), yP + m_plat_cm*sin(phi + 330*pi/180)];
+    P3 = [xP + m_plat_cm*cos(phi +  90*pi/180), yP + m_plat_cm*sin(phi +  90*pi/180)];
+    P  = [P1; P2; P3];
+
+    theta = zeros(1,3);
+    J_kin = zeros(3,3);
+    J_pos = zeros(3,2);
+    ok = true;
+
+    for i = 1:3
+        dx = P(i,1)-A(i,1); dy = P(i,2)-A(i,2);
+        d  = sqrt(dx^2+dy^2);
+        if d > 2*l || d < 0.01, ok = false; break; end
+        arg = min(max(d/(2*l),-1),1);
+        al  = atan2(dy,dx);
+        be  = acos(arg);
+
+        % Chon elbow lien tuc
+        if k == 1
+            theta(i) = al - be;
+        else
+            sol1 = al - be; sol2 = al + be;
+            if abs(angdiff(sol1, theta_all(max(k-1,1),i))) <= abs(angdiff(sol2, theta_all(max(k-1,1),i)))
+                theta(i) = sol1;
+            else
+                theta(i) = sol2;
+            end
+        end
+
+        J_pos(i,:) = [A(i,1) + l*cos(theta(i)), A(i,2) + l*sin(theta(i))];
+        J_kin(i,1) = -l*sin(theta(i));
+        J_kin(i,2) =  l*cos(theta(i));
+        J_kin(i,3) = -l*sin(theta(i))*(P(i,2)-yP) + l*cos(theta(i))*(P(i,1)-xP);
+    end
+
+    if ~ok || ~ik_ok(k)
+        if k > 1
+            theta_all(k,:) = theta_all(k-1,:);
+        end
+        continue;
+    end
+
+    theta_all(k,:) = theta;
+    dJ = abs(det(J_kin));
+    det_J_all(k)  = dJ;
+    cond_J_all(k) = ternval(dJ > 1e-10, cond(J_kin), Inf);
+    singularity_flag(k) = dJ < sing_thr;
+    near_sing_flag(k)   = cond_J_all(k) > cond_thr;
+
+    % Van toc diem P
+    if k > 1 && k < n
+        vx = (x_traj(k+1)-x_traj(k-1))/(2*dt);
+        vy = (y_traj(k+1)-y_traj(k-1))/(2*dt);
+    elseif k == 1
+        vx = (x_traj(2)-x_traj(1))/dt;
+        vy = (y_traj(2)-y_traj(1))/dt;
+    else
+        vx = (x_traj(end)-x_traj(end-1))/dt;
+        vy = (y_traj(end)-y_traj(end-1))/dt;
+    end
+    v_mag(k) = sqrt(vx^2+vy^2);
+
+    if k > 1
+        omega = (theta_all(k,:)-theta_all(k-1,:))/dt;
+        rpm_all(k,:) = abs(omega)*60/(2*pi);
+        rpm_over_flag(k,:) = rpm_all(k,:) > rpm_max_adj;
+    end
+
+    if k > 1
+        % Gia tri tham chieu buoc k (goc hinh hoc)
+        q_ref    = q_geo(k,:)';
+        dq_ref   = dq_d(k,:)';
+        ddq_ref  = ddq_d(k,:)';
+        q_ref_prev = q_geo(k-1,:)';
+
+        % Gia tri tham chieu encoder (cho PID)
+        q_enc_ref      = q_d(k,:)';
+        q_enc_ref_prev = q_d(k-1,:)';
+
+        n_inner = max(1, ceil(dt/sim_ctrl_dt));
+        h_inner = dt / n_inner;
+        u_pid_cmd = u_pid_cmd_state;
+
+        for jj = 1:n_inner
+            blend = jj / n_inner;
+
+            % --- PID (goc encoder) ---
+            q_enc_i   = q_enc_ref_prev + blend*(q_enc_ref - q_enc_ref_prev);
+            target_pulse = q_enc_i * scale;
+            q_meas_pulse = round(q_pid * scale - offset_rad*scale);
+            e_pid_pulse  = target_pulse - q_meas_pulse;
+
+            I_err_pid = I_err_pid + e_pid_pulse*h_inner;
+            I_err_pid = max(min(I_err_pid, Imax_pid), -Imax_pid);
+
+            de_pid_raw  = (e_pid_pulse - e_prev_pid)/h_inner;
+            de_pid_filt = deriv_filter*de_pid_raw + (1-deriv_filter)*de_pid_filt;
+            e_prev_pid  = e_pid_pulse;
+
+            u_pid_cmd = kp_pid*e_pid_pulse + ki_pid*I_err_pid + kd_pid*de_pid_filt;
+            u_pid_cmd = max(min(u_pid_cmd, PWM_MAX), -PWM_MAX);
+            u_deadband = sign(u_pid_cmd).*max(abs(u_pid_cmd)-PWM_DEADBAND, 0);
+            u_deadband = u_deadband * PWM_MAX/(PWM_MAX-PWM_DEADBAND);
+            u_pid_motor_state = max(min(u_deadband, PWM_MAX), -PWM_MAX);
+
+            v_pid = motor_efficiency*(u_pid_motor_state/PWM_RESOLUTION_MAX)*V_supply;
+            motor_current_pid = motor_current_pid + (h_inner/L_motor)*...
+                (v_pid - R_motor*motor_current_pid - Ke_motor*dq_pid);
+            motor_current_pid = max(min(motor_current_pid, I_stall), -I_stall);
+            tau_pid_state = Kt_motor * motor_current_pid;
+            tau_pid_state = max(min(tau_pid_state, tau_max), -tau_max);
+
+            % Dong luc hoc PID (M, C dung q_geo tuong duong)
+            friction_p = tau_friction*sign(dq_pid) + B_viscous*dq_pid;
+            [M_p, C_p] = calc_dynamics(q_pid, dq_pid, x_m(k), y_m(k));
+            ddq_pid = M_p \ (tau_pid_state - C_p*dq_pid - calc_G(q_pid) - friction_p);
+            dq_pid  = dq_pid + ddq_pid*h_inner;
+            q_pid   = q_pid  + dq_pid *h_inner;
+
+            % --- CTC (Computed Torque Control) ---
+            q_ref_i   = q_ref_prev + blend*(q_ref - q_ref_prev);
+            q_meas_ctc = q_ctc + 0.15*sigma_encoder*randn(3,1);
+            e_ctc  = q_ref_i - q_meas_ctc;
+            I_err_ctc = I_err_ctc + e_ctc*h_inner;
+            I_err_ctc = max(min(I_err_ctc, 0.4), -0.4);
+            de_ctc = dq_ref - dq_ctc;
+
+            a_des = ddq_ref + Kd_ctc*de_ctc + Kp_ctc*e_ctc + Ki_ctc*I_err_ctc;
+
+            [M_c, C_c] = calc_dynamics(q_ctc, dq_ctc, x_m(k), y_m(k));
+            G_c = calc_G(q_ctc);
+            tau_ctc_cmd = M_c*a_des + C_c*dq_ctc + G_c;
+            tau_ctc_cmd = max(min(tau_ctc_cmd, tau_max), -tau_max);
+            tau_ctc_state = tau_ctc_state + (h_inner/motor_tau)*(tau_ctc_cmd - tau_ctc_state);
+
+            friction_c = tau_friction*sign(dq_ctc) + B_viscous*dq_ctc;
+            ddq_ctc = M_c \ (tau_ctc_state - C_c*dq_ctc - G_c - friction_c);
+            dq_ctc  = dq_ctc + ddq_ctc*h_inner;
+            q_ctc   = q_ctc  + dq_ctc *h_inner;
+        end
+
+        u_pid_cmd_state     = u_pid_cmd;
+        q_pid_log(k,:)      = q_pid';
+        q_ctc_log(k,:)      = q_ctc';
+        tau_ctc_log(k,:)    = tau_ctc_state';
+        tau_pid_eq_log(k,:) = tau_pid_state';
+        pwm_pid_log(k,:)    = u_pid_motor_state';
+        pwm_pid_cmd_log(k,:)= u_pid_cmd_state';
+        e_pid_log(k,:)      = (q_geo(k,:)' - q_pid)';
+        e_ctc_log(k,:)      = e_ctc';
+    end
+
+    % Hoa hinh 2D
+    for i = 1:3
+        set(h_link2d(i),'XData',[A(i,1) J_pos(i,1) P(i,1)],'YData',[A(i,2) J_pos(i,2) P(i,2)]);
+    end
+    set(pt_plat2d,'XData',[P1(1) P2(1) P3(1)],'YData',[P1(2) P2(2) P3(2)]);
+    set(pt_G2d,'XData',xP,'YData',yP);
+
+    % Hoa hinh 3D
+    za = 0;
+    for i = 1:3
+        Ex = J_pos(i,1); Ey = J_pos(i,2);
+        Px_i = P(i,1); Py_i = P(i,2);
+        ptA=[A(i,1),A(i,2),za]; ptE=[Ex,Ey,za]; ptPi=[Px_i,Py_i,za];
+        [cx_t,cy_t,cz_t] = arm_body_surf(ptA,ptE,hw,ht);
+        set(h3d_links(i,1),'XData',cx_t,'YData',cy_t,'ZData',cz_t);
+        [cx_t,cy_t,cz_t] = arm_cap_arc(ptA,ptE,-1,hw,ht,n_cap);
+        set(h3d_caps1(i,1),'XData',cx_t,'YData',cy_t,'ZData',cz_t);
+        [cx_t,cy_t,cz_t] = arm_cap_arc(ptA,ptE,+1,hw,ht,n_cap);
+        set(h3d_caps2(i,1),'XData',cx_t,'YData',cy_t,'ZData',cz_t);
+        [cx_t,cy_t,cz_t] = arm_body_surf(ptE,ptPi,hw,ht);
+        set(h3d_links(i,2),'XData',cx_t,'YData',cy_t,'ZData',cz_t);
+        [cx_t,cy_t,cz_t] = arm_cap_arc(ptE,ptPi,-1,hw,ht,n_cap);
+        set(h3d_caps1(i,2),'XData',cx_t,'YData',cy_t,'ZData',cz_t);
+        [cx_t,cy_t,cz_t] = arm_cap_arc(ptE,ptPi,+1,hw,ht,n_cap);
+        set(h3d_caps2(i,2),'XData',cx_t,'YData',cy_t,'ZData',cz_t);
+        [sx2,sy2,sz2] = sphere(12);
+        set(h3d_joints(i,1),'XData',sx2*jr+Ex,'YData',sy2*jr+Ey,'ZData',sz2*jr+za);
+        set(h3d_joints(i,2),'XData',sx2*jr+Px_i,'YData',sy2*jr+Py_i,'ZData',sz2*jr+za);
+    end
+    set(h3d_plat,'XData',[P1(1) P2(1) P3(1)],'YData',[P1(2) P2(2) P3(2)],'ZData',[za za za]);
+    set(h3d_ctr,'XData',xP,'YData',yP,'ZData',za);
+
+    % Sin/cos markers
+    for i = 1:3
+        h_sin_pt(i).XData = t_k; h_sin_pt(i).YData = sin(theta(i));
+        h_cos_pt(i).XData = t_k; h_cos_pt(i).YData = cos(theta(i));
+    end
+
+    % Panel phai
+    if k > 1
+        for i = 1:3
+            ln_r(1,i).XData = [ln_r(1,i).XData, t_k];
+            ln_r(1,i).YData = [ln_r(1,i).YData, tau_ctc_log(k,i)*1000];
+            pt_r(1,i).XData = t_k; pt_r(1,i).YData = tau_ctc_log(k,i)*1000;
+            ln_tau_pid(i).XData = [ln_tau_pid(i).XData, t_k];
+            ln_tau_pid(i).YData = [ln_tau_pid(i).YData, tau_pid_eq_log(k,i)*1000];
+            pt_tau_pid(i).XData = t_k; pt_tau_pid(i).YData = tau_pid_eq_log(k,i)*1000;
+
+            ln_r(2,i).XData = [ln_r(2,i).XData, t_k];
+            ln_r(2,i).YData = [ln_r(2,i).YData, pwm_pid_log(k,i)];
+            pt_r(2,i).XData = t_k; pt_r(2,i).YData = pwm_pid_log(k,i);
+            ln_pwm_cmd(i).XData = [ln_pwm_cmd(i).XData, t_k];
+            ln_pwm_cmd(i).YData = [ln_pwm_cmd(i).YData, pwm_pid_cmd_log(k,i)];
+            pt_pwm_cmd(i).XData = t_k; pt_pwm_cmd(i).YData = pwm_pid_cmd_log(k,i);
+
+            ln_r(3,i).XData = [ln_r(3,i).XData, t_k];
+            ln_r(3,i).YData = [ln_r(3,i).YData, rad2deg(e_ctc_log(k,i))];
+            pt_r(3,i).XData = t_k; pt_r(3,i).YData = rad2deg(e_ctc_log(k,i));
+
+            ln_r(4,i).XData = [ln_r(4,i).XData, t_k];
+            ln_r(4,i).YData = [ln_r(4,i).YData, rad2deg(e_pid_log(k,i))];
+            pt_r(4,i).XData = t_k; pt_r(4,i).YData = rad2deg(e_pid_log(k,i));
+        end
+    end
+
+    % Panel info
+    theta_enc_deg = rad2deg(theta) - offset_deg';
+    ss = 'OK - An toan'; sc = [0 0.55 0];
+    if singularity_flag(k), ss = 'CANH BAO KY DI';     sc = [0.85 0 0]; end
+    if near_sing_flag(k),   ss = 'CANH BAO GAN KY DI'; sc = [0.9 0.45 0]; end
+    rs = 'RPM: OK'; rc_ = [0 0.55 0];
+    if any(rpm_over_flag(k,:)), rs = 'RPM: QUA TAI'; rc_ = [0.85 0 0]; end
+
+    rms_pid_k = sqrt(mean(e_pid_log(1:max(k,1),:).^2,'all'));
+    rms_ctc_k = sqrt(mean(e_ctc_log(1:max(k,1),:).^2,'all'));
+    improve_k = ternval(rms_pid_k > 1e-10, (1-rms_ctc_k/rms_pid_k)*100, 0);
+
+    info = sprintf(['Buoc: %d/%d  t=%.2fs\n\n' ...
+        'Vi tri:\n  X=%.2f  Y=%.2f cm\n\n' ...
+        'Goc hinh hoc (deg):\n  th1=%.2f\n  th2=%.2f\n  th3=%.2f\n' ...
+        'Goc encoder (deg):\n  e1=%.2f\n  e2=%.2f\n  e3=%.2f\n\n' ...
+        'Van toc: %.2f cm/s\n\n' ...
+        'RPM:\n  M1: %.1f  M2: %.1f  M3: %.1f\n\n' ...
+        'PWM lenh PID:\n  %.1f  %.1f  %.1f\n' ...
+        'PWM motor:\n  %.1f  %.1f  %.1f\n\n' ...
+        'Moment CTC (mN.m):\n  %.3f  %.3f  %.3f\n\n' ...
+        'Sai so RMS (deg):\n  CTC: %.4f\n  PID: %.4f\n  +%.1f%%\n\n' ...
+        'Jacobian:\n  det=%.5f\n  cond=%.2f'], ...
+        k,n,t_k, xP,yP, ...
+        rad2deg(theta(1)),rad2deg(theta(2)),rad2deg(theta(3)), ...
+        theta_enc_deg(1),theta_enc_deg(2),theta_enc_deg(3), ...
+        v_mag(k), rpm_all(k,1),rpm_all(k,2),rpm_all(k,3), ...
+        pwm_pid_cmd_log(max(k,1),1),pwm_pid_cmd_log(max(k,1),2),pwm_pid_cmd_log(max(k,1),3), ...
+        pwm_pid_log(max(k,1),1),pwm_pid_log(max(k,1),2),pwm_pid_log(max(k,1),3), ...
+        tau_ctc_log(max(k,1),1)*1000,tau_ctc_log(max(k,1),2)*1000,tau_ctc_log(max(k,1),3)*1000, ...
+        rad2deg(rms_ctc_k),rad2deg(rms_pid_k),improve_k, ...
+        det_J_all(k),cond_J_all(k));
+
+    cla(ax_info);
+    text(ax_info,0.05,0.99,info,'VerticalAlignment','top','FontSize',7.0,'Units','normalized','FontName','FixedWidth');
+    text(ax_info,0.50,0.11,ss,'VerticalAlignment','middle','HorizontalAlignment','center','FontSize',11,'FontWeight','bold','Color',sc,'Units','normalized');
+    text(ax_info,0.50,0.04,rs,'VerticalAlignment','middle','HorizontalAlignment','center','FontSize',10,'FontWeight','bold','Color',rc_,'Units','normalized');
+    axis(ax_info,'off');
+
+    drawnow limitrate;
+    pause(0.006);
+end
+
+fprintf('=== MO PHONG HOAN THANH ===\n');
+
+%% Final axis limits
+for sp = 1:1
+    ymax = max(abs([tau_ctc_log(:); tau_pid_eq_log(:)]))*1000*1.25;
+    ymax = max(ymax,20); ymax = min(ymax,tau_max*1000*1.05);
+    ylim(ax_r(sp),[-ymax ymax]);
+    if any(singularity_flag)
+        si = find(singularity_flag);
+        plot(ax_r(sp),T_vec(si),tau_ctc_log(si,1)*1000,'kx','MarkerSize',6,'LineWidth',1.5,'HandleVisibility','off');
+    end
+end
+ylim(ax_r(2),[-PWM_MAX PWM_MAX]);
+for sp = 3:4
+    dat = ternval(sp==3, e_ctc_log, e_pid_log);
+    ymax = max(abs(rad2deg(dat(:))))*1.25;
+    if ymax < 0.01, ymax = 0.5; end
+    ylim(ax_r(sp),[-ymax ymax]);
+end
+drawnow;
+
+%% ====================================================================
+%  KET QUA TONG HOP (fprintf - khong Figure 3)
+% =====================================================================
+vi = find(det_J_all ~= 0);
+rms_pid_tot = sqrt(mean(e_pid_log(:).^2));
+rms_ctc_tot = sqrt(mean(e_ctc_log(:).^2));
+pwm_pid_max     = max(abs(pwm_pid_log));
+pwm_pid_cmd_max = max(abs(pwm_pid_cmd_log));
+tau_ctc_max     = max(abs(tau_ctc_log));
+
+fprintf('\n====== KET QUA TONG HOP ======\n');
+fprintf('Buoc hop le: %d/%d  |  Ky di: %d  |  Gan ky di: %d\n', ...
+    length(vi), n, sum(singularity_flag), sum(near_sing_flag));
+fprintf('\n%-22s %10s %10s %10s\n','Chi so','Khop 1','Khop 2','Khop 3');
+fprintf('%-22s %10.4f %10.4f %10.4f  (deg)\n','RMS PID', ...
+    rad2deg(sqrt(mean(e_pid_log(:,1).^2))), rad2deg(sqrt(mean(e_pid_log(:,2).^2))), rad2deg(sqrt(mean(e_pid_log(:,3).^2))));
+fprintf('%-22s %10.4f %10.4f %10.4f  (deg)\n','RMS CTC', ...
+    rad2deg(sqrt(mean(e_ctc_log(:,1).^2))), rad2deg(sqrt(mean(e_ctc_log(:,2).^2))), rad2deg(sqrt(mean(e_ctc_log(:,3).^2))));
+fprintf('%-22s %10.4f %10.4f  (deg)\n','RMS tong  PID/CTC', rad2deg(rms_pid_tot), rad2deg(rms_ctc_tot));
+fprintf('%-22s %10.1f%%\n','Cai thien CTC vs PID', (1-rms_ctc_tot/rms_pid_tot)*100);
+fprintf('%-22s %10.1f %10.1f %10.1f\n','PWM lenh max', pwm_pid_cmd_max(1),pwm_pid_cmd_max(2),pwm_pid_cmd_max(3));
+fprintf('%-22s %10.1f %10.1f %10.1f\n','PWM motor max', pwm_pid_max(1),pwm_pid_max(2),pwm_pid_max(3));
+fprintf('%-22s %10.4f %10.4f %10.4f  (N.m)\n','Moment CTC max', tau_ctc_max(1),tau_ctc_max(2),tau_ctc_max(3));
+for i = 1:3
+    if any(abs(pwm_pid_cmd_log(:,i)) >= PWM_MAX)
+        fprintf('[WARN] Khop %d: lenh PWM cham nguong bao hoa!\n',i);
+    end
+end
+
+%% ====================================================================
+%  FIGURE 2: PHAN TICH SO SANH CTC vs PID
+% =====================================================================
+fig2 = figure('Name','Phan Tich CTC vs PID','NumberTitle','off','Color','white',...
+    'Units','normalized','OuterPosition',[0.05 0.05 0.90 0.90]);
+
+col_ctc2 = [0.10 0.45 0.85];
+col_pid2 = [0.85 0.15 0.15];
+col_ref2 = [0.10 0.10 0.10];
+kn = {'Khop 1','Khop 2','Khop 3'};
+
+for i = 1:3
+    ax = subplot(3,3,i); hold on; grid on; box on;
+    plot(T_vec,rad2deg(q_geo(:,i)),'--','Color',col_ref2,'LineWidth',1.5,'DisplayName','Tham chieu');
+    plot(T_vec,rad2deg(q_ctc_log(:,i)),'-','Color',col_ctc2,'LineWidth',1.8,'DisplayName','CTC');
+    plot(T_vec,rad2deg(q_pid_log(:,i)),'-','Color',col_pid2,'LineWidth',1.8,'DisplayName','PID');
+    title(sprintf('%s - Goc khop',kn{i}),'FontWeight','bold');
+    xlabel('t (s)'); ylabel('theta (deg)');
+    if i==1, legend('Location','best','FontSize',8); end
+    set(ax,'FontSize',9);
+end
+
+for i = 1:3
+    ax = subplot(3,3,3+i); hold on; grid on; box on;
+    plot(T_vec,rad2deg(e_ctc_log(:,i)),'-','Color',col_ctc2,'LineWidth',1.8,'DisplayName','CTC');
+    plot(T_vec,rad2deg(e_pid_log(:,i)),'-','Color',col_pid2,'LineWidth',1.8,'DisplayName','PID');
+    yline(0,'k--','LineWidth',0.8,'HandleVisibility','off');
+    title(sprintf('%s - Sai so',kn{i}),'FontWeight','bold');
+    xlabel('t (s)'); ylabel('e (deg)');
+    text(0.02,0.93,sprintf('RMS CTC=%.4f deg  PID=%.4f deg', ...
+        rad2deg(sqrt(mean(e_ctc_log(:,i).^2))), rad2deg(sqrt(mean(e_pid_log(:,i).^2)))),...
+        'Units','normalized','FontSize',7.5,'Color',[0.3 0.3 0.3]);
+    if i==1, legend('Location','best','FontSize',8); end
+    set(ax,'FontSize',9);
+end
+
+for i = 1:3
+    ax = subplot(3,3,6+i); hold on; grid on; box on;
+    plot(T_vec,tau_ctc_log(:,i)*1000,'-','Color',col_ctc2,'LineWidth',1.8,'DisplayName','CTC');
+    plot(T_vec,tau_pid_eq_log(:,i)*1000,'-','Color',col_pid2,'LineWidth',1.8,'DisplayName','PID eq');
+    yline( tau_max*1000,'r--','LineWidth',1,'HandleVisibility','off');
+    yline(-tau_max*1000,'r--','LineWidth',1,'HandleVisibility','off');
+    title(sprintf('%s - Moment',kn{i}),'FontWeight','bold');
+    xlabel('t (s)'); ylabel('tau (mN.m)');
+    text(0.02,0.93,sprintf('max CTC=%.1f  PIDeq=%.1f mN.m', ...
+        tau_ctc_max(i)*1000, max(abs(tau_pid_eq_log(:,i)))*1000),...
+        'Units','normalized','FontSize',7.5,'Color',[0.3 0.3 0.3]);
+    if i==1, legend('Location','best','FontSize',8); end
+    set(ax,'FontSize',9);
+end
+
+sgtitle(fig2, sprintf('Phan tich CTC vs PID | %s | v=%.1f cm/s | Cai thien: %.1f%%', ...
+    traj_names{traj_choice}, v_des, (1-rms_ctc_tot/rms_pid_tot)*100),...
+    'FontSize',12,'FontWeight','bold');
+
+fprintf('\n=== HOAN THANH - Da tao 2 hinh ===\n');
+fprintf('Hinh 1: Mo phong realtime day du\n');
+fprintf('Hinh 2: So sanh CTC vs PID\n');
+
+end % end function
+
+%% ====================================================================
+%  HAM PHU TRO
+% =====================================================================
+
+% Ham tinh dich goc ([-pi, pi])
+function d = angdiff(a, b)
+d = mod(a - b + pi, 2*pi) - pi;
+end
+
+function [Xc,Yc,Zc] = arm_body_surf(p1, p2, hw, ht)
+vec = p2 - p1; len = norm(vec);
+if len < 1e-6, Xc=zeros(2,5); Yc=Xc; Zc=Xc; return; end
+ax_l = vec/len;
+ax_w = cross([0 0 1], ax_l);
+if norm(ax_w)<1e-6, ax_w=[1 0 0]; else, ax_w=ax_w/norm(ax_w); end
+ax_t = cross(ax_l,ax_w); ax_t=ax_t/norm(ax_t);
+cs = [hw,ht; hw,-ht; -hw,-ht; -hw,ht; hw,ht];
+Xc=zeros(2,5); Yc=Xc; Zc=Xc;
+for ii=1:2
+    pt = ternval(ii==1, p1, p2);
+    for jj=1:5
+        off = cs(jj,1)*ax_w + cs(jj,2)*ax_t;
+        Xc(ii,jj)=pt(1)+off(1); Yc(ii,jj)=pt(2)+off(2); Zc(ii,jj)=pt(3)+off(3);
+    end
+end
+end
+
+function [Xc,Yc,Zc] = arm_cap_arc(p1, p2, side, hw, ht, n_cap)
+vec = p2-p1; len = norm(vec);
+if len < 1e-6, Xc=zeros(n_cap,5); Yc=Xc; Zc=Xc; return; end
+ax_l=vec/len;
+ax_w=cross([0 0 1],ax_l);
+if norm(ax_w)<1e-6, ax_w=[1 0 0]; else, ax_w=ax_w/norm(ax_w); end
+ax_t=cross(ax_l,ax_w); ax_t=ax_t/norm(ax_t);
+if side<0, ctr=p1; dir=-ax_l; else, ctr=p2; dir=ax_l; end
+cs = [hw,ht; hw,-ht; -hw,-ht; -hw,ht; hw,ht];
+phi_v=linspace(-pi/2,pi/2,n_cap);
+Xc=zeros(n_cap,5); Yc=Xc; Zc=Xc;
+for ii=1:n_cap
+    phi=phi_v(ii); pt=ctr+dir*(hw*sin(phi));
+    for jj=1:5
+        off=cs(jj,1)*cos(phi)*ax_w+cs(jj,2)*ax_t;
+        Xc(ii,jj)=pt(1)+off(1); Yc(ii,jj)=pt(2)+off(2); Zc(ii,jj)=pt(3)+off(3);
+    end
+end
+end
+
+function r = ternval(cond, tv, fv)
+if cond, r=tv; else, r=fv; end
+end
